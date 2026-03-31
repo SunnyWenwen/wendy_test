@@ -150,24 +150,26 @@ Request with header:  t-tenant-id: t-12345678
 
 ### 3.1 新增欄位：`tenant_tpm`
 
+`default` 與 `overrides` 的值都是 **陣列**，每個元素包含 `name`（對應 AI instance 名稱）、`limit`、`time_window`，讓不同 instance 可以設定不同的 tenant TPM 配額。
+
 ```jsonc
 {
   "tenant_tpm": {
-    // 必填：套用到所有沒有 override 的 tenant
-    "default": {
-      "limit": 10000,       // 每個 tenant 每時間窗口的 token 上限
-      "time_window": 60     // 時間窗口（秒）
-    },
-    // 選填：特定 tenant 的個別設定
+    // 必填：對每個 AI instance 設定每個 tenant 的預設 TPM 上限
+    "default": [
+      { "name": "openai-primary",  "limit": 10000, "time_window": 60 },
+      { "name": "deepseek-backup", "limit": 5000,  "time_window": 60 }
+    ],
+    // 選填：特定 tenant 的個別設定（覆蓋 default）
     "overrides": {
-      "t-12345678": {       // VIP tenant，更高配額
-        "limit": 50000,
-        "time_window": 60
-      },
-      "t-99999999": {       // 受限 tenant，更低配額
-        "limit": 1000,
-        "time_window": 60
-      }
+      "t-12345678": [              // VIP tenant，更高配額
+        { "name": "openai-primary",  "limit": 50000, "time_window": 60 },
+        { "name": "deepseek-backup", "limit": 20000, "time_window": 60 }
+      ],
+      "t-99999999": [              // 受限 tenant，更低配額
+        { "name": "openai-primary", "limit": 1000, "time_window": 60 }
+        // deepseek-backup 未設定 → 沿用 default[deepseek-backup] = 5000
+      ]
     }
   }
 }
@@ -175,12 +177,16 @@ Request with header:  t-tenant-id: t-12345678
 
 ### 3.2 配額查找優先序
 
-```
-Request tenant_id = "t-12345678"
+對每個 **(instance_name, tenant_id)** 組合，lookup 順序：
 
-1. 查 overrides["t-12345678"]  → 找到 → 用 50,000 TPM
-2. 查 overrides["t-unknown"]   → 找不到 → 用 default 10,000 TPM
-3. 無 t-tenant-id header       → 跳過 tenant 檢查
+```
+instance_name = "openai-primary", tenant_id = "t-12345678"
+
+1. overrides["t-12345678"] 陣列中找 name == "openai-primary"  → 找到 → 用 50,000 TPM
+2. overrides["t-unknown"]  陣列中找 name == "openai-primary"  → overrides 無此 key
+   → default 陣列中找 name == "openai-primary"                → 找到 → 用 10,000 TPM
+3. instance_name 在 default/override 陣列中都找不到            → 跳過 tenant 限流
+4. 無 t-tenant-id header                                      → 跳過 tenant 檢查
 ```
 
 ### 3.3 完整 Schema 範例
@@ -192,10 +198,18 @@ Request tenant_id = "t-12345678"
     { "name": "deepseek-backup", "limit": 50000,  "time_window": 60 }
   ],
   "tenant_tpm": {
-    "default": { "limit": 10000, "time_window": 60 },
+    "default": [
+      { "name": "openai-primary",  "limit": 10000, "time_window": 60 },
+      { "name": "deepseek-backup", "limit": 5000,  "time_window": 60 }
+    ],
     "overrides": {
-      "t-00000001": { "limit": 50000, "time_window": 60 },
-      "t-00000002": { "limit": 1000,  "time_window": 60 }
+      "t-00000001": [
+        { "name": "openai-primary",  "limit": 50000, "time_window": 60 },
+        { "name": "deepseek-backup", "limit": 20000, "time_window": 60 }
+      ],
+      "t-00000002": [
+        { "name": "openai-primary", "limit": 200, "time_window": 60 }
+      ]
     }
   },
   "limit_strategy":  "total_tokens",
@@ -233,8 +247,8 @@ limit_conf_cache       { ttl=300, count=512  }   ← 現有，keyed by conf tabl
 tenant_limit_conf_cache{ ttl=300, count=4096 }   ← 新增，keyed by "<conf_id>#<tenant_id>"
 ```
 
-tenant cache 使用字串 key 是因為 tenant_id 來自 request，無法以 conf table identity 作為 key。
-count=4096 可容納 4096 個不同的 (config, tenant) 組合，應足以應對大多數生產場景。
+tenant cache 使用字串 key `"<conf_id>#<instance_name>#<tenant_id>"` 是因為這三個維度都來自 runtime，無法以 conf table identity 作為 key。
+count=4096 可容納 4096 個不同的 (config, instance, tenant) 組合，應足以應對大多數生產場景。
 
 ### 4.3 Tenant 不存在時的行為
 
@@ -242,7 +256,8 @@ count=4096 可容納 4096 個不同的 (config, tenant) 組合，應足以應對
 |---|---|
 | Request 沒有 `t-tenant-id` header | 跳過 tenant 檢查，只做 instance 限流 |
 | `tenant_tpm` 沒有設定 | 跳過 tenant 檢查（完全向後相容） |
-| Tenant ID 不在 overrides 中 | 使用 `default` 配額 |
+| Tenant ID 不在 overrides 中 | 在 `default` 陣列中查找對應 instance entry |
+| Instance name 在 default/override 陣列中都找不到 | 跳過此 (instance, tenant) 的 tenant 限流 |
 | Redis 連線失敗（`allow_degradation: true`） | Fail-open，允許通過，記錄 error log |
 
 ---
@@ -311,10 +326,16 @@ redis-cli KEYS "plugin-ai-rate-limiting-redis*" | xargs redis-cli DEL
         { "name": "openai-primary", "limit": 100000, "time_window": 60 }
       ],
       "tenant_tpm": {
-        "default":   { "limit": 1000, "time_window": 60 },
+        "default": [
+          { "name": "openai-primary", "limit": 1000, "time_window": 60 }
+        ],
         "overrides": {
-          "t-00000001": { "limit": 5000, "time_window": 60 },
-          "t-00000002": { "limit": 200,  "time_window": 60 }
+          "t-00000001": [
+            { "name": "openai-primary", "limit": 5000, "time_window": 60 }
+          ],
+          "t-00000002": [
+            { "name": "openai-primary", "limit": 200, "time_window": 60 }
+          ]
         }
       },
       "limit_strategy":  "total_tokens",
@@ -664,12 +685,15 @@ redis-cli KEYS "plugin-ai-rate-limiting-redis*" | xargs redis-cli DEL
 ## 8. 與 RFC-001 的 diff 摘要
 
 ```lua
--- 新增：tenant_limit_entry_schema
+-- v1 → v2 新增 / 修改：
+-- 新增：tenant_limit_entry_schema  (含 name, limit, time_window)
+-- 新增：tenant_limit_list_schema   (陣列型別)
 -- 新增：tenant_tpm_schema
 -- 修改：schema.properties 加入 tenant_tpm 欄位
 
--- 新增：get_plugin_conf_id()   (取得穩定的 plugin conf 識別 ID)
--- 新增：copy_redis_conf()      (從 transform_limit_conf 抽取，消除重複)
+-- 新增：get_plugin_conf_id()              (取得穩定的 plugin conf 識別 ID)
+-- 新增：copy_redis_conf()                 (從 transform_limit_conf 抽取，消除重複)
+-- 新增：find_instance_limit_in_list()     (在陣列中依 name 查找 entry)
 -- 新增：build_tenant_limit_conf()
 -- 新增：get_tenant_limit_conf()
 -- 新增：tenant_limit_conf_cache (LRU, count=4096)
@@ -677,9 +701,9 @@ redis-cli KEYS "plugin-ai-rate-limiting-redis*" | xargs redis-cli DEL
 -- 修改：transform_limit_conf() — 加入 conf.group 修正 Redis key 建構
 --       (limit-count gen_limit_key 需要 conf.group 或 conf._meta.parent.resource_key，
 --        自建 limit_conf 無 _meta.parent，必須用 conf.group bypass)
--- 修改：build_tenant_limit_conf() — 同上，加入 conf.group
--- 修改：_M.access() — Step 2 tenant check
--- 修改：_M.log()    — timer 內增加 tenant counter 更新
+-- 修改：build_tenant_limit_conf() — 陣列 lookup；找不到 instance entry 時回傳 nil
+-- 修改：_M.access() — Step 2 tenant check（nil conf 時跳過）
+-- 修改：_M.log()    — timer 內增加 tenant counter 更新（nil conf 時跳過）
 
 -- 不變：_M.check_instance_status()
 -- 不變：fetch_limit_conf_kvs()
@@ -695,14 +719,25 @@ redis-cli KEYS "plugin-ai-rate-limiting-redis*" | xargs redis-cli DEL
 ```json
 {
   "tenant_tpm": {
-    "default": { "limit": 5000, "time_window": 60 },
+    "default": [
+      { "name": "openai-primary",  "limit": 5000,  "time_window": 60 },
+      { "name": "deepseek-backup", "limit": 2000,  "time_window": 60 }
+    ],
     "overrides": {
-      "t-vip-001": { "limit": 100000, "time_window": 60 },
-      "t-trial-001": { "limit": 500, "time_window": 60 }
+      "t-vip-001": [
+        { "name": "openai-primary",  "limit": 100000, "time_window": 60 },
+        { "name": "deepseek-backup", "limit": 50000,  "time_window": 60 }
+      ],
+      "t-trial-001": [
+        { "name": "openai-primary", "limit": 500, "time_window": 60 }
+      ]
     }
   }
 }
 ```
+
+> **注意：** override 陣列中未列出的 instance，會 fallback 到 `default` 陣列中對應的 entry。
+> 若 `default` 陣列中也找不到，則對該 (instance, tenant) 組合**跳過** tenant 限流（不報錯）。
 
 ### 若 overrides 數量超過 LRU count (4096)
 

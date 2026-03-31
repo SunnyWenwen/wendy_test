@@ -16,7 +16,16 @@
 --
 
 -- =============================================================================
--- ai-rate-limiting-redis  (v2 — with per-tenant TPM support)
+-- ai-rate-limiting-redis  (v3 — per-instance tenant TPM arrays)
+--
+-- Changes vs v2:
+--   • `tenant_tpm.default`   is now an ARRAY of { name, limit, time_window }
+--     instead of a single flat object – each entry targets one AI instance.
+--   • `tenant_tpm.overrides` values are now arrays of the same shape.
+--   • Added `find_instance_limit_in_list()` helper for array lookup.
+--   • `build_tenant_limit_conf` returns nil when no entry matches the
+--     current (instance_name, tenant_id) pair – access/log phases skip
+--     tenant limiting in that case rather than applying a wrong limit.
 --
 -- Changes vs v1:
 --   • Added  `tenant_tpm`  config block  (default limit + per-tenant overrides)
@@ -51,26 +60,35 @@ local instance_limit_schema = {
     required = { "name", "limit", "time_window" },
 }
 
--- NEW: a single { limit, time_window } entry reused in tenant_tpm schema
+-- NEW: a single per-instance entry: { name, limit, time_window }
+--   `name` matches the AI instance name (e.g. "azure-open-ai")
 local tenant_limit_entry_schema = {
     type = "object",
     properties = {
+        name        = { type = "string", minLength = 1 },
         limit       = { type = "integer", minimum = 1 },
         time_window = { type = "integer", minimum = 1 },
     },
-    required = { "limit", "time_window" },
+    required = { "name", "limit", "time_window" },
+}
+
+-- Array of per-instance tenant TPM entries
+local tenant_limit_list_schema = {
+    type     = "array",
+    items    = tenant_limit_entry_schema,
+    minItems = 1,
 }
 
 -- NEW: tenant_tpm block
---   default   – applied to every tenant that has no explicit override
---   overrides – map of tenant_id (e.g. "t-12345678") -> { limit, time_window }
+--   default   – array of per-instance limits applied to every tenant without override
+--   overrides – map of tenant_id -> array of per-instance limits
 local tenant_tpm_schema = {
     type = "object",
     properties = {
-        default   = tenant_limit_entry_schema,
+        default   = tenant_limit_list_schema,
         overrides = {
             type                 = "object",
-            additionalProperties = tenant_limit_entry_schema,
+            additionalProperties = tenant_limit_list_schema,
             description          = "Per-tenant TPM overrides keyed by tenant ID (e.g. 't-12345678')",
         },
     },
@@ -232,6 +250,17 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
     return conf
 end
 
+-- NEW: Search an array of { name, limit, time_window } entries for a specific
+--      instance name.  Returns the matching entry or nil if not found.
+local function find_instance_limit_in_list(list, instance_name)
+    for _, entry in ipairs(list) do
+        if entry.name == instance_name then
+            return entry
+        end
+    end
+    return nil
+end
+
 -- NEW: Build a limit_conf for a specific (instance, tenant) pair.
 --
 --   conf.group format:  "<plugin_conf_id>#<instance_name>#tenant#<tenant_id>"
@@ -239,15 +268,24 @@ end
 --
 --   This ensures each (instance, tenant) combination has its own independent
 --   counter: tenant t-12345678 on openai-primary and on deepseek-backup are
---   tracked separately, both subject to the same limit value from tenant_tpm.
+--   tracked separately.
 --
---   Tenant-specific override is used when present; otherwise `default` applies.
+--   Lookup order:
+--     1. overrides[tenant_id] list  → entry matching instance_name
+--     2. default list               → entry matching instance_name
+--     3. nil (no config for this instance → no tenant check)
 local function build_tenant_limit_conf(plugin_conf, instance_name, tenant_id)
     local tenant_tpm = plugin_conf.tenant_tpm
 
-    -- Pick override if exists, else default
-    local limit_cfg = (tenant_tpm.overrides and tenant_tpm.overrides[tenant_id])
-                      or tenant_tpm.default
+    -- Pick the right list: override list for this tenant, or the default list
+    local override_list = tenant_tpm.overrides and tenant_tpm.overrides[tenant_id]
+    local limit_cfg = (override_list and find_instance_limit_in_list(override_list, instance_name))
+                      or find_instance_limit_in_list(tenant_tpm.default, instance_name)
+
+    -- No entry configured for this (instance, tenant) combination → skip limiting
+    if not limit_cfg then
+        return nil
+    end
 
     -- Encode both dimensions into the key so Redis counters are independent
     -- per (instance, tenant) pair.
@@ -362,24 +400,33 @@ function _M.access(conf, ctx)
             -- own tenant TPM independently.
             local tenant_limit_conf = get_tenant_limit_conf(conf, ai_instance_name, tenant_id)
 
-            local t_code, t_msg = limit_count.rate_limit(
-                tenant_limit_conf, ctx, plugin_name, 1, true
-            )
-
-            if t_code then
-                -- Tenant budget exhausted – restore both placeholders.
-                limit_count.rate_limit(limit_conf,        ctx, plugin_name, -1, false)
-                limit_count.rate_limit(tenant_limit_conf, ctx, plugin_name, -1, false)
-
-                core.log.info(
-                    "tenant rate limit exceeded in access phase",
-                    " tenant: ",   tenant_id,
-                    " instance: ", ai_instance_name,
-                    " code: ",     t_code,
-                    ", both placeholders restored"
+            if tenant_limit_conf then
+                -- An entry exists for this (instance, tenant) → enforce it.
+                local t_code, t_msg = limit_count.rate_limit(
+                    tenant_limit_conf, ctx, plugin_name, 1, true
                 )
-                ctx.ai_rate_limiting = true
-                return t_code, t_msg or ("tenant " .. tenant_id .. " TPM rate limit exceeded")
+
+                if t_code then
+                    -- Tenant budget exhausted – restore both placeholders.
+                    limit_count.rate_limit(limit_conf,        ctx, plugin_name, -1, false)
+                    limit_count.rate_limit(tenant_limit_conf, ctx, plugin_name, -1, false)
+
+                    core.log.info(
+                        "tenant rate limit exceeded in access phase",
+                        " tenant: ",   tenant_id,
+                        " instance: ", ai_instance_name,
+                        " code: ",     t_code,
+                        ", both placeholders restored"
+                    )
+                    ctx.ai_rate_limiting = true
+                    return t_code, t_msg or ("tenant " .. tenant_id .. " TPM rate limit exceeded")
+                end
+            else
+                -- No config entry for this (instance_name, tenant_id) pair → skip.
+                core.log.info(
+                    "no tenant_tpm entry for instance: ", ai_instance_name,
+                    " tenant: ", tenant_id, ", skipping tenant check"
+                )
             end
 
             -- Store tenant_id so the log phase can find the right counter.
@@ -489,8 +536,12 @@ function _M.log(conf, ctx)
     local tenant_id = ctx.ai_tenant_id
     if conf.tenant_tpm and tenant_id then
         local tenant_limit_conf = get_tenant_limit_conf(conf, instance_name, tenant_id)
-        timer_tenant_limit_conf = core.table.deepcopy(tenant_limit_conf)
-        timer_tenant_limit_conf.show_limit_quota_header = false
+        -- tenant_limit_conf may be nil when no entry is configured for this
+        -- (instance_name, tenant_id) combination – in that case skip adjustment.
+        if tenant_limit_conf then
+            timer_tenant_limit_conf = core.table.deepcopy(tenant_limit_conf)
+            timer_tenant_limit_conf.show_limit_quota_header = false
+        end
     end
 
     local timer_ctx = {
