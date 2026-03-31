@@ -232,24 +232,31 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
     return conf
 end
 
--- NEW: Build a limit_conf for a specific tenant.
+-- NEW: Build a limit_conf for a specific (instance, tenant) pair.
 --
---   conf.group format:  "<plugin_conf_id>#tenant#<tenant_id>"
+--   conf.group format:  "<plugin_conf_id>#<instance_name>#tenant#<tenant_id>"
 --   Final Redis key:    "plugin-ai-rate-limiting-redis<group>:<key>"
+--
+--   This ensures each (instance, tenant) combination has its own independent
+--   counter: tenant t-12345678 on openai-primary and on deepseek-backup are
+--   tracked separately, both subject to the same limit value from tenant_tpm.
+--
 --   Tenant-specific override is used when present; otherwise `default` applies.
-local function build_tenant_limit_conf(plugin_conf, tenant_id)
+local function build_tenant_limit_conf(plugin_conf, instance_name, tenant_id)
     local tenant_tpm = plugin_conf.tenant_tpm
 
     -- Pick override if exists, else default
     local limit_cfg = (tenant_tpm.overrides and tenant_tpm.overrides[tenant_id])
                       or tenant_tpm.default
 
-    local key   = "tenant#" .. tenant_id
+    -- Encode both dimensions into the key so Redis counters are independent
+    -- per (instance, tenant) pair.
+    local key   = instance_name .. "#tenant#" .. tenant_id
     local group = get_plugin_conf_id(plugin_conf) .. "#" .. key
 
     local conf = {
         _vid      = key,
-        conf_id   = get_plugin_conf_id(plugin_conf) .. "#" .. tenant_id,
+        conf_id   = get_plugin_conf_id(plugin_conf) .. "#" .. key,
         group     = group,
         key       = key,
         meta      = plugin_conf._meta,
@@ -276,13 +283,15 @@ local function build_tenant_limit_conf(plugin_conf, tenant_id)
     return conf
 end
 
--- NEW: Retrieve (or build + cache) the tenant limit_conf for a given tenant_id.
-local function get_tenant_limit_conf(plugin_conf, tenant_id)
-    local conf_id   = plugin_conf._meta and plugin_conf._meta.id or "default"
-    local cache_key = conf_id .. "#" .. tenant_id
+-- NEW: Retrieve (or build + cache) the tenant limit_conf for a given
+--      (instance_name, tenant_id) pair.
+local function get_tenant_limit_conf(plugin_conf, instance_name, tenant_id)
+    local conf_id   = get_plugin_conf_id(plugin_conf)
+    -- Cache key must include both instance and tenant to avoid cross-contamination.
+    local cache_key = conf_id .. "#" .. instance_name .. "#" .. tenant_id
     return tenant_limit_conf_cache(
         cache_key, nil,
-        build_tenant_limit_conf, plugin_conf, tenant_id
+        build_tenant_limit_conf, plugin_conf, instance_name, tenant_id
     )
 end
 
@@ -349,7 +358,9 @@ function _M.access(conf, ctx)
     if conf.tenant_tpm then
         local tenant_id = ngx.var.http_t_tenant_id
         if tenant_id and tenant_id ~= "" then
-            local tenant_limit_conf = get_tenant_limit_conf(conf, tenant_id)
+            -- Counter is per (instance, tenant): each AI instance tracks its
+            -- own tenant TPM independently.
+            local tenant_limit_conf = get_tenant_limit_conf(conf, ai_instance_name, tenant_id)
 
             local t_code, t_msg = limit_count.rate_limit(
                 tenant_limit_conf, ctx, plugin_name, 1, true
@@ -472,11 +483,12 @@ function _M.log(conf, ctx)
     local timer_limit_conf = core.table.deepcopy(limit_conf)
     timer_limit_conf.show_limit_quota_header = false
 
-    -- NEW: prepare tenant limit_conf for the timer if a tenant was identified
+    -- NEW: prepare tenant limit_conf for the timer if a tenant was identified.
+    --      Must use the same (instance_name, tenant_id) pair as the access phase.
     local timer_tenant_limit_conf
     local tenant_id = ctx.ai_tenant_id
     if conf.tenant_tpm and tenant_id then
-        local tenant_limit_conf = get_tenant_limit_conf(conf, tenant_id)
+        local tenant_limit_conf = get_tenant_limit_conf(conf, instance_name, tenant_id)
         timer_tenant_limit_conf = core.table.deepcopy(tenant_limit_conf)
         timer_tenant_limit_conf.show_limit_quota_header = false
     end

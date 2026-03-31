@@ -47,21 +47,23 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │  Access Phase                                                    │
 │                                                                  │
-│  Step 1:  Instance 維度  →  Redis Key: "<conf_id>#openai-primary:openai-primary"  │
-│           limit: 100,000 TPM (整個 instance 共享)                                │
+│  Step 1:  Instance 維度                                                          │
+│           Redis Key: "<conf_id>#openai-primary:openai-primary"                   │
+│           limit: 100,000 TPM (整個 instance 共享，所有 tenant 合計)               │
 │                    ↓ pass                                                        │
-│  Step 2:  Tenant 維度    →  Redis Key: "<conf_id>#tenant#t-12345678:tenant#..."  │
-│           limit:  10,000 TPM (此 tenant 個人配額)                │
-│                    ↓ pass                                        │
-│           放行請求至上游                                          │
+│  Step 2:  Tenant × Instance 維度                                                 │
+│           Redis Key: "<conf_id>#openai-primary#tenant#t-12345678:..."            │
+│           limit:  10,000 TPM (此 tenant 在此 instance 的個人配額)                 │
+│                    ↓ pass                                                        │
+│           放行請求至上游                                                          │
 └──────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────┐
 │  Log Phase (ngx.timer)                                           │
 │                                                                  │
 │  同時更新：                                                       │
-│    ① Instance counter  INCRBY "<conf_id>#openai-primary:..."         (actual - 1)  │
-│    ② Tenant   counter  INCRBY "<conf_id>#tenant#t-12345678:..."      (actual - 1)  │
+│    ① Instance counter        INCRBY "<conf_id>#openai-primary:..."       (N-1)  │
+│    ② Tenant×Instance counter INCRBY "<conf_id>#openai-primary#tenant#...:..." (N-1)  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -80,12 +82,15 @@ Instance 維度（現有）:
   key = "plugin-ai-rate-limiting-redis<conf_id>#<instance_name>:<instance_name>"
   ex:   "plugin-ai-rate-limiting-redisroute-abc#openai-primary:openai-primary"
 
-Tenant 維度（新增）:
-  key = "plugin-ai-rate-limiting-redis<conf_id>#tenant#<tenant_id>:tenant#<tenant_id>"
-  ex:   "plugin-ai-rate-limiting-redisroute-abc#tenant#t-12345678:tenant#t-12345678"
+Tenant × Instance 維度（新增）:
+  key = "plugin-ai-rate-limiting-redis<conf_id>#<instance_name>#tenant#<tenant_id>:<instance_name>#tenant#<tenant_id>"
+  ex:   "plugin-ai-rate-limiting-redisroute-abc#openai-primary#tenant#t-12345678:openai-primary#tenant#t-12345678"
+  ex:   "plugin-ai-rate-limiting-redisroute-abc#deepseek-backup#tenant#t-12345678:deepseek-backup#tenant#t-12345678"
 ```
 
 其中 `<conf_id>` = `plugin_conf._meta.id`（APISIX route plugin config ID，跨重啟穩定）。
+
+**每個 (instance, tenant) 組合各有獨立計數器**：同一個 tenant 在 openai-primary 和 deepseek-backup 上的配額互不影響。
 
 > 兩個 key 在 Redis 中完全獨立，TTL 也各自管理。
 
@@ -110,7 +115,7 @@ Request with header:  t-tenant-id: t-12345678
                               │ OK
                ┌──────────────▼──────────────────┐
                │  STEP 2: Tenant TPM check                                │  (只有 tenant_tpm 設定時才執行)
-               │  group = "<conf_id>#tenant#t-12345678"               │
+               │  group = "<conf_id>#openai-primary#tenant#t-12345678" │
                │  INCRBY key 1 (placeholder)      │
                └──────────────┬──────────────────┘
                               │
@@ -134,8 +139,8 @@ Request with header:  t-tenant-id: t-12345678
                │  actual_tokens = 847             │
                │  extra = 847 - 1 = 846           │
                │                                  │
-               │  INCRBY "<conf_id>#openai-primary:openai-primary"   +846  │
-               │  INCRBY "<conf_id>#tenant#t-12345678:tenant#..."     +846  │
+               │  INCRBY "<conf_id>#openai-primary:openai-primary"                 +846  │
+               │  INCRBY "<conf_id>#openai-primary#tenant#t-12345678:..."      +846  │
                └──────────────────────────────────┘
 ```
 
@@ -371,12 +376,12 @@ curl -X POST http://apisix:9080/ai/chat \
 **驗證：**
 ```bash
 # 找出實際 key（含 conf_id）
-redis-cli KEYS "plugin-ai-rate-limiting-redis*tenant#t-99999999*"
-# ex: "plugin-ai-rate-limiting-redis<conf_id>#tenant#t-99999999:tenant#t-99999999"
+redis-cli KEYS "plugin-ai-rate-limiting-redis*openai-primary#tenant#t-99999999*"
+# ex: "plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 
 # 確認 TTL = 60 秒、餘額為 999（placeholder -1）
-redis-cli TTL  "plugin-ai-rate-limiting-redis<conf_id>#tenant#t-99999999:tenant#t-99999999"  # 接近 60
-redis-cli GET  "plugin-ai-rate-limiting-redis<conf_id>#tenant#t-99999999:tenant#t-99999999"  # 999
+redis-cli TTL  "plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"  # 接近 60
+redis-cli GET  "plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"  # 999
 ```
 
 ---
@@ -399,7 +404,7 @@ curl -X POST http://apisix:9080/ai/chat \
 
 **驗證：**
 ```bash
-redis-cli GET "plugin-ai-rate-limiting-redis<conf_id>#tenant#t-00000001:tenant#t-00000001"  # 應為 4999
+redis-cli GET "plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-00000001:openai-primary#tenant#t-00000001"  # 應為 4999
 ```
 
 ---
@@ -427,7 +432,7 @@ curl -X POST http://apisix:9080/ai/chat \
 
 ```bash
 # 直接用 redis-cli 把 t-00000002 的餘額設成 0（模擬已耗盡）
-TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-00000002:tenant#t-00000002"
+TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-00000002:openai-primary#tenant#t-00000002"
 redis-cli SET "$TENANT_KEY" 0 EX 60
 
 # 發送請求，應被拒絕
@@ -445,7 +450,7 @@ curl -v -X POST http://apisix:9080/ai/chat \
 **驗證：**
 ```bash
 INST_KEY="plugin-ai-rate-limiting-redis<conf_id>#openai-primary:openai-primary"
-TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-00000002:tenant#t-00000002"
+TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-00000002:openai-primary#tenant#t-00000002"
 redis-cli GET "$INST_KEY"    # 應維持超限前的值（placeholder 已還原）
 redis-cli GET "$TENANT_KEY"  # 應為 0 或 -1（INCRBY 後 restore）
 ```
@@ -470,8 +475,8 @@ curl -X POST http://apisix:9080/ai/chat \
 
 **驗證：**
 ```bash
-KEY_A="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-00000001:tenant#t-00000001"
-KEY_B="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-99999999:tenant#t-99999999"
+KEY_A="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-00000001:openai-primary#tenant#t-00000001"
+KEY_B="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 
 redis-cli GET "$KEY_A"   # 接近 4999（5000 - 1 placeholder）
 redis-cli GET "$KEY_B"   # 接近 999（1000 - 1 placeholder）
@@ -504,7 +509,7 @@ curl -v -X POST http://apisix:9080/ai/chat \
 
 **驗證：**
 ```bash
-TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-00000001:tenant#t-00000001"
+TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-00000001:openai-primary#tenant#t-00000001"
 redis-cli EXISTS "$TENANT_KEY"  # 應為 0（key 不存在，從未被寫入）
 ```
 
@@ -526,7 +531,7 @@ done
 
 **預期（假設每次 100 tokens）：**
 ```
-TENANT_KEY = "plugin-ai-rate-limiting-redis<conf_id>#tenant#t-99999999:tenant#t-99999999"
+TENANT_KEY = "plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 
 初始:          TENANT_KEY = 1000
 請求 1 access: TENANT_KEY = 999  (佔位 -1)
@@ -540,7 +545,7 @@ TENANT_KEY = "plugin-ai-rate-limiting-redis<conf_id>#tenant#t-99999999:tenant#t-
 **驗證：**
 ```bash
 # 等待所有 timer 執行完畢後
-TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-99999999:tenant#t-99999999"
+TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 redis-cli GET "$TENANT_KEY"
 # 預期值 ≈ 1000 - (100 * 3) = 700
 ```
@@ -572,8 +577,8 @@ wait
 
 **驗證：**
 ```bash
-KEY_A="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-00000001:tenant#t-00000001"
-KEY_B="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-99999999:tenant#t-99999999"
+KEY_A="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-00000001:openai-primary#tenant#t-00000001"
+KEY_B="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 KEY_I="plugin-ai-rate-limiting-redis<conf_id>#openai-primary:openai-primary"
 
 redis-cli GET "$KEY_A"  # 應有消耗，接近上限 5000
@@ -607,29 +612,36 @@ curl -X POST http://apisix:9080/ai/chat \
 
 ### 6.3 Redis Key 驗證速查
 
-Redis key 格式：`plugin-ai-rate-limiting-redis<conf_id>#<dimension>:<dimension>`
+```
+Key 格式：
+  Instance:        plugin-ai-rate-limiting-redis<conf_id>#<instance>:<instance>
+  Tenant×Instance: plugin-ai-rate-limiting-redis<conf_id>#<instance>#tenant#<tid>:<instance>#tenant#<tid>
+```
 
 ```bash
 # ── 列出所有 rate limit keys（找出實際 conf_id）──────────────────────────
 redis-cli KEYS "plugin-ai-rate-limiting-redis*"
 
-# ── 列出所有 tenant counter ──────────────────────────────────────────────
-redis-cli KEYS "plugin-ai-rate-limiting-redis*tenant#*"
+# ── 列出所有 tenant×instance counter ────────────────────────────────────
+redis-cli KEYS "plugin-ai-rate-limiting-redis*#tenant#*"
 
-# ── 查看特定 tenant 的剩餘配額與 TTL ─────────────────────────────────────
-TENANT_KEY="plugin-ai-rate-limiting-redis<conf_id>#tenant#t-12345678:tenant#t-12345678"
-redis-cli GET "$TENANT_KEY"
-redis-cli TTL "$TENANT_KEY"
+# ── 查看特定 (instance, tenant) 的剩餘配額與 TTL ─────────────────────────
+TKEY="plugin-ai-rate-limiting-redis<conf_id>#openai-primary#tenant#t-12345678:openai-primary#tenant#t-12345678"
+redis-cli GET "$TKEY"
+redis-cli TTL "$TKEY"
 
-# ── 列出所有 instance counter ────────────────────────────────────────────
-redis-cli KEYS "plugin-ai-rate-limiting-redis*#openai-primary*"
-redis-cli KEYS "plugin-ai-rate-limiting-redis*#deepseek-*"
+# ── 列出特定 instance 的所有 tenant counter ──────────────────────────────
+redis-cli KEYS "plugin-ai-rate-limiting-redis*#openai-primary#tenant#*"
+redis-cli KEYS "plugin-ai-rate-limiting-redis*#deepseek-backup#tenant#*"
+
+# ── 列出 instance 本身的 counter（排除 tenant）───────────────────────────
+redis-cli KEYS "plugin-ai-rate-limiting-redis*#openai-primary:openai-primary"
 
 # ── 監控所有 Redis 操作（debug 用）───────────────────────────────────────
 redis-cli MONITOR
 
 # ── 清除所有 tenant counter（重置）──────────────────────────────────────
-redis-cli KEYS "plugin-ai-rate-limiting-redis*tenant#*" | xargs redis-cli DEL
+redis-cli KEYS "plugin-ai-rate-limiting-redis*#tenant#*" | xargs redis-cli DEL
 
 # ── 清除所有 rate limiting counter（完整重置）───────────────────────────
 redis-cli KEYS "plugin-ai-rate-limiting-redis*" | xargs redis-cli DEL
