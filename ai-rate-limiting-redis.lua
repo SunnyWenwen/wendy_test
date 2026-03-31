@@ -163,6 +163,13 @@ end
 -- Internal helpers
 -- ---------------------------------------------------------------------------
 
+-- Return a stable string identifier for the plugin_conf, used as the Redis key
+-- namespace (via conf.group).  Must be stable across process restarts.
+-- Falls back to "default" when _meta.id is absent (edge case / local config).
+local function get_plugin_conf_id(plugin_conf)
+    return (plugin_conf._meta and plugin_conf._meta.id) or "default"
+end
+
 -- Copy Redis connection fields from plugin_conf into a limit_conf table.
 -- Extracted to avoid duplication between instance and tenant conf builders.
 local function copy_redis_conf(plugin_conf, conf)
@@ -193,9 +200,15 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
         time_window = instance_conf.time_window
     end
 
+    -- conf.group bypasses limit-count's gen_limit_key parent.resource_key requirement.
+    -- Format: "<plugin_conf_id>#<instance_key>"
+    -- Final Redis key: "plugin-ai-rate-limiting-redis<group>:<key>"
+    local group = get_plugin_conf_id(plugin_conf) .. "#" .. key
+
     local conf = {
         _vid      = key,
         conf_id   = plugin_conf._meta and plugin_conf._meta.id or key,
+        group     = group,
         key       = key,
         meta      = plugin_conf._meta,
         count     = limit,
@@ -221,8 +234,8 @@ end
 
 -- NEW: Build a limit_conf for a specific tenant.
 --
---   Redis key format:  "tenant#<tenant_id>"
---   This keeps tenant counters separate from instance counters.
+--   conf.group format:  "<plugin_conf_id>#tenant#<tenant_id>"
+--   Final Redis key:    "plugin-ai-rate-limiting-redis<group>:<key>"
 --   Tenant-specific override is used when present; otherwise `default` applies.
 local function build_tenant_limit_conf(plugin_conf, tenant_id)
     local tenant_tpm = plugin_conf.tenant_tpm
@@ -231,12 +244,13 @@ local function build_tenant_limit_conf(plugin_conf, tenant_id)
     local limit_cfg = (tenant_tpm.overrides and tenant_tpm.overrides[tenant_id])
                       or tenant_tpm.default
 
-    local key = "tenant#" .. tenant_id
+    local key   = "tenant#" .. tenant_id
+    local group = get_plugin_conf_id(plugin_conf) .. "#" .. key
 
     local conf = {
         _vid      = key,
-        conf_id   = (plugin_conf._meta and plugin_conf._meta.id or "default")
-                    .. "#" .. tenant_id,
+        conf_id   = get_plugin_conf_id(plugin_conf) .. "#" .. tenant_id,
+        group     = group,
         key       = key,
         meta      = plugin_conf._meta,
         count       = limit_cfg.limit,
