@@ -260,6 +260,52 @@ count=4096 可容納 4096 個不同的 (config, instance, tenant) 組合，應�
 | Instance name 在 default/override 陣列中都找不到 | 跳過此 (instance, tenant) 的 tenant 限流 |
 | Redis 連線失敗（`allow_degradation: true`） | Fail-open，允許通過，記錄 error log |
 
+### 4.4 Streaming API 支援
+
+**結論：Streaming 模式無需額外修改，開箱即用。**
+
+APISIX 3.15 在 `before_proxy` 階段偵測到 `request.stream == true` 時，會**自動注入** `stream_options: { include_usage: true }` 到送往 LLM 的請求：
+
+```lua
+-- apisix/plugins/ai-proxy/base.lua（APISIX 內建邏輯，非本 plugin）
+if request_body.stream then
+    request_body.stream_options = { include_usage = true }
+    ctx.var.request_type = "ai_stream"
+end
+```
+
+SSE chunk 解析器（`openai-base.lua`）在讀取最後一個含 `usage` 的 chunk 時，設定：
+
+```lua
+ctx.ai_token_usage = {
+    prompt_tokens     = data.usage.prompt_tokens     or 0,
+    completion_tokens = data.usage.completion_tokens or 0,
+    total_tokens      = data.usage.total_tokens      or 0,
+}
+```
+
+到 `_M.log` 執行時，`ctx.ai_token_usage` 已由 APISIX 填好，與非串流請求路徑完全一致。
+
+#### 串流 vs 非串流行為比較
+
+| 面向 | 非串流 | 串流 SSE |
+|---|---|---|
+| `ctx.ai_token_usage` 設定時機 | 完整 response body 解析後 | 最後一個含 usage 的 SSE chunk 解析後 |
+| `stream_options` | N/A | APISIX 自動注入 `include_usage: true` |
+| Access Phase（placeholder +1） | 正常 | 正常（串流開始前即扣） |
+| Log Phase（actual - 1 調整） | 正常 | 正常（串流結束、log 觸發時執行） |
+| Tenant counter 更新 | 正常 | 正常 |
+
+#### 邊緣情況：Provider 不支援 streaming usage
+
+若 LLM provider 不回傳 `usage` 欄位（未遵循 `stream_options`），`ctx.ai_token_usage` 為 nil，log phase 會：
+
+1. 記錄 error log：`"failed to get token usage for llm service"`
+2. 提前 return，不執行 extra_tokens 調整
+3. Access phase 預扣的 `+1` placeholder **不會被校正** → counter 每次串流請求偏移 `+1`
+
+此行為與上游 `ai-rate-limiting` plugin 一致，並非本 plugin 引入的問題。
+
 ---
 
 ## 5. Response Headers
