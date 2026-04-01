@@ -1,0 +1,37 @@
+--- a/apisix/plugins/ai-proxy-multi.lua
++++ b/apisix/plugins/ai-proxy-multi.lua
+@@ -371,14 +371,30 @@ local function pick_target(ctx, conf, ups_tab)
+ 
+     if conf.fallback_strategy == "instance_health_and_rate_limiting" or -- for backwards compatible
+        fallback_strategy_has(conf.fallback_strategy, "rate_limiting") then
+-        local ai_rate_limiting = require("apisix.plugins.ai-rate-limiting")
++        -- Dynamically discover which rate-limiting plugin is active for this route.
++        -- Supports "ai-rate-limiting" (built-in) and custom variants such as
++        -- "ai-rate-limiting-redis".  Passing conf directly avoids a redundant
++        -- ctx.plugins scan inside check_instance_status.
++        local rl_mod, rl_conf
++        local route_plugins = ctx.plugins
++        local rl_candidates = { "ai-rate-limiting-redis", "ai-rate-limiting" }
++        for _, pname in ipairs(rl_candidates) do
++            for i = 1, #route_plugins, 2 do
++                if route_plugins[i]["name"] == pname then
++                    local ok, mod = pcall(require, "apisix.plugins." .. pname)
++                    if ok and mod.check_instance_status then
++                        rl_mod  = mod
++                        rl_conf = route_plugins[i + 1]
++                        break
++                    end
++                end
++            end
++            if rl_mod then break end
++        end
++        -- Fallback: load base plugin and pass nil conf (original behaviour)
++        if not rl_mod then
++            rl_mod = require("apisix.plugins.ai-rate-limiting")
++        end
+         for _ = 1, #conf.instances do
+-            if ai_rate_limiting.check_instance_status(nil, ctx, instance_name) then
++            if rl_mod.check_instance_status(rl_conf, ctx, instance_name) then
+                 break
+             end
+             core.log.info("ai instance: ", instance_name,
