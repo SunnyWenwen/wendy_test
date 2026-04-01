@@ -16,23 +16,28 @@
 --
 
 -- =============================================================================
--- ai-rate-limiting-redis  (v3 — per-instance tenant TPM arrays)
+-- ai-rate-limiting-redis  (v4 — post-hoc token accounting, no access-phase placeholder)
 --
--- Changes vs v2:
---   • `tenant_tpm.default`   is now an ARRAY of { name, limit, time_window }
---     instead of a single flat object – each entry targets one AI instance.
---   • `tenant_tpm.overrides` values are now arrays of the same shape.
---   • Added `find_instance_limit_in_list()` helper for array lookup.
---   • `build_tenant_limit_conf` returns nil when no entry matches the
---     current (instance_name, tenant_id) pair – access/log phases skip
---     tenant limiting in that case rather than applying a wrong limit.
+-- Changes vs v3:
+--   • Access phase uses cost=0 (pure read / INCRBY key 0 for Redis) instead of
+--     the +1 placeholder.  No counter is touched until the LLM responds.
+--   • Log phase deducts the full actual token count (no "actual - 1" adjustment).
+--   • All +1 / -1 restore logic removed: access phase never writes to Redis.
+--   • check_instance_status also uses cost=0: pure availability probe.
+--   • Trade-off: concurrent requests that arrive when remaining > 0 may
+--     collectively exceed the limit within one window before counters catch up.
+--     This is acceptable because (a) token counts are unknowable at request time
+--     and (b) the previous +1 placeholder was too small to provide meaningful
+--     concurrency protection anyway.
+--
+-- Changes vs v2 (per-instance arrays):
+--   • tenant_tpm.default / overrides are arrays of { name, limit, time_window }
+--   • find_instance_limit_in_list() for array lookup
+--   • build_tenant_limit_conf returns nil when no entry matches
 --
 -- Changes vs v1:
---   • Added  `tenant_tpm`  config block  (default limit + per-tenant overrides)
---   • Access phase: after instance check, also checks the tenant TPM budget
---   • Log   phase: the ngx.timer also adjusts the tenant counter
---   • New helper: `build_tenant_limit_conf` / `get_tenant_limit_conf`
---   • All other code paths are UNCHANGED to minimise diff with upstream.
+--   • Added tenant_tpm config block
+--   • Access + Log phases handle tenant dimension
 -- =============================================================================
 
 local require        = require
@@ -370,59 +375,52 @@ function _M.access(conf, ctx)
     end
 
     -- -----------------------------------------------------------------------
-    -- Step 1: Instance-level check (unchanged from v1)
+    -- Step 1: Instance-level check
+    -- cost=0 → INCRBY key 0 for Redis: pure read, counter untouched.
+    -- The actual token deduction happens in the log phase after the LLM
+    -- responds and the real token count is known.
     -- -----------------------------------------------------------------------
-    local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
+    local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, 0, false)
     if code then
-        limit_count.rate_limit(limit_conf, ctx, plugin_name, -1, false)
         core.log.info(
             "rate limit exceeded in access phase for instance: ", ai_instance_name,
-            " code: ", code, ", placeholder quota restored"
+            " code: ", code
         )
         ctx.ai_rate_limiting = true
         return code, msg
     end
 
     -- -----------------------------------------------------------------------
-    -- Step 2: Tenant-level check (NEW)
+    -- Step 2: Tenant-level check
     --
     -- Only executed when:
     --   a) `tenant_tpm` is configured in the plugin config, AND
     --   b) the incoming request carries a non-empty `t-tenant-id` header.
     --
-    -- If the tenant limit is exceeded the instance placeholder reserved in
-    -- Step 1 is also restored to avoid counter drift.
+    -- Also uses cost=0: no counter is written in access phase.
     -- -----------------------------------------------------------------------
     if conf.tenant_tpm then
         local tenant_id = ngx.var.http_t_tenant_id
         if tenant_id and tenant_id ~= "" then
-            -- Counter is per (instance, tenant): each AI instance tracks its
-            -- own tenant TPM independently.
             local tenant_limit_conf = get_tenant_limit_conf(conf, ai_instance_name, tenant_id)
 
             if tenant_limit_conf then
-                -- An entry exists for this (instance, tenant) → enforce it.
+                -- cost=0: check remaining budget without touching the counter.
                 local t_code, t_msg = limit_count.rate_limit(
-                    tenant_limit_conf, ctx, plugin_name, 1, true
+                    tenant_limit_conf, ctx, plugin_name, 0, false
                 )
 
                 if t_code then
-                    -- Tenant budget exhausted – restore both placeholders.
-                    limit_count.rate_limit(limit_conf,        ctx, plugin_name, -1, false)
-                    limit_count.rate_limit(tenant_limit_conf, ctx, plugin_name, -1, false)
-
                     core.log.info(
                         "tenant rate limit exceeded in access phase",
                         " tenant: ",   tenant_id,
                         " instance: ", ai_instance_name,
-                        " code: ",     t_code,
-                        ", both placeholders restored"
+                        " code: ",     t_code
                     )
                     ctx.ai_rate_limiting = true
                     return t_code, t_msg or ("tenant " .. tenant_id .. " TPM rate limit exceeded")
                 end
             else
-                -- No config entry for this (instance_name, tenant_id) pair → skip.
                 core.log.info(
                     "no tenant_tpm entry for instance: ", ai_instance_name,
                     " tenant: ", tenant_id, ", skipping tenant check"
@@ -470,13 +468,10 @@ function _M.check_instance_status(conf, ctx, instance_name)
         return true
     end
 
-    local code, _ = limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
+    -- cost=0: pure availability probe, counter unchanged.
+    local code, _ = limit_count.rate_limit(limit_conf, ctx, plugin_name, 0, false)
     if code then
-        limit_count.rate_limit(limit_conf, ctx, plugin_name, -1, false)
-        core.log.info(
-            "rate limit for instance: ", instance_name,
-            " code: ", code, ", quota restored"
-        )
+        core.log.info("rate limit for instance: ", instance_name, " code: ", code)
         return false
     end
     return true
@@ -518,20 +513,16 @@ function _M.log(conf, ctx)
         return
     end
 
-    -- extra_tokens = actual usage - placeholder already reserved in access phase
-    local extra_tokens = used_tokens - 1
-
-    if extra_tokens == 0 then
-        core.log.info("token usage equals placeholder, no adjustment needed")
-        return
-    end
+    -- Deduct the full actual token count.  Access phase did not touch the
+    -- counter (cost=0), so no placeholder adjustment is needed.
+    local extra_tokens = used_tokens
 
     -- Disable header writing inside timer (socket API not available in log phase)
     local timer_limit_conf = core.table.deepcopy(limit_conf)
     timer_limit_conf.show_limit_quota_header = false
 
-    -- NEW: prepare tenant limit_conf for the timer if a tenant was identified.
-    --      Must use the same (instance_name, tenant_id) pair as the access phase.
+    -- Prepare tenant limit_conf for the timer if a tenant was identified.
+    -- Must use the same (instance_name, tenant_id) pair as the access phase.
     local timer_tenant_limit_conf
     local tenant_id = ctx.ai_tenant_id
     if conf.tenant_tpm and tenant_id then
@@ -559,27 +550,19 @@ function _M.log(conf, ctx)
             return
         end
 
-        -- Adjust instance counter (unchanged from v1)
+        -- Deduct actual token usage from the instance counter.
         local code, msg = limit_count.rate_limit(
             timer_limit_conf, timer_ctx, plugin_name, extra_tokens
         )
         if code then
             core.log.warn("failed to update instance token usage in background: ", msg)
         else
-            if extra_tokens > 0 then
-                core.log.info(
-                    "deducted ", extra_tokens,
-                    " additional tokens for instance: ", instance_name
-                )
-            else
-                core.log.info(
-                    "restored ", -extra_tokens,
-                    " tokens for instance: ", instance_name
-                )
-            end
+            core.log.info(
+                "deducted ", extra_tokens, " tokens for instance: ", instance_name
+            )
         end
 
-        -- NEW: Adjust tenant counter with the same delta
+        -- Deduct actual token usage from the tenant counter (same delta).
         if timer_tenant_limit_conf then
             local t_code, t_msg = limit_count.rate_limit(
                 timer_tenant_limit_conf, timer_ctx, plugin_name, extra_tokens
@@ -589,17 +572,9 @@ function _M.log(conf, ctx)
                     "failed to update tenant token usage in background: ", t_msg
                 )
             else
-                if extra_tokens > 0 then
-                    core.log.info(
-                        "deducted ", extra_tokens,
-                        " additional tokens for tenant: ", tenant_id
-                    )
-                else
-                    core.log.info(
-                        "restored ", -extra_tokens,
-                        " tokens for tenant: ", tenant_id
-                    )
-                end
+                core.log.info(
+                    "deducted ", extra_tokens, " tokens for tenant: ", tenant_id
+                )
             end
         end
     end)
