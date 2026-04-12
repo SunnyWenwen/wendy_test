@@ -1110,13 +1110,98 @@ redis-cli GET "$KEY"
 
 ---
 
+#### TC-F06: Tenant TPM 滿觸發 Fallback（核心測試）
+
+**目的：** 驗證 `check_instance_status` 同時檢查 tenant TPM，tenant 配額耗盡時 ai-proxy-multi 自動切換 instance。
+
+路由設定：**僅配置 tenant_tpm，不配置 instances**（instance TPM 全部 optional）。
+
+```json
+{
+  "ai-rate-limiting": {
+    "tenant_tpm": {
+      "default": [
+        { "name": "openai-p1-a", "limit": 1000, "time_window": 60 },
+        { "name": "openai-p1-b", "limit": 1000, "time_window": 60 }
+      ]
+    },
+    "limit_strategy": "total_tokens",
+    "policy": "redis",
+    "redis_host": "127.0.0.1",
+    "redis_port": 6379
+  }
+}
+```
+
+```bash
+# 把 t-00000001 在 openai-p1-a 上的 tenant counter 設滿
+TKEY_A="plugin-ai-rate-limiting<conf_id>#openai-p1-a#tenant#t-00000001:openai-p1-a#tenant#t-00000001"
+redis-cli SET "$TKEY_A" 1001 EX 60
+
+# 發送請求（帶 tenant header）
+curl -v -X POST http://apisix:9080/ai/chat \
+  -H "t-tenant-id: t-00000001" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}'
+```
+
+**預期：**
+- HTTP 200（非 429）
+- Response 含 `X-AI-RateLimit-Limit-Tenant: 1000` 且 `X-AI-RateLimit-Remaining-Tenant` 接近 1000
+  （表示打到了 openai-p1-b，其 tenant counter 是獨立的，尚有餘量）
+- `openai-p1-a` 的 tenant counter 仍為 1001（check_instance_status cost=0，無副作用）
+
+**驗證：**
+```bash
+TKEY_B="plugin-ai-rate-limiting<conf_id>#openai-p1-b#tenant#t-00000001:openai-p1-b#tenant#t-00000001"
+redis-cli GET "$TKEY_A"   # 仍為 1001（check 不寫入）
+redis-cli GET "$TKEY_B"   # log phase 寫入後應有 actual token 數（e.g. 847）
+```
+
+**Fallback 觸發路徑：**
+```
+check_instance_status(conf, ctx, "openai-p1-a")
+  → Step 1: 無 instance-level limit → 跳過
+  → Step 2: tenant_tpm 有設定，t-tenant-id = "t-00000001"
+            get_tenant_limit_conf(conf, "openai-p1-a", "t-00000001") → 找到
+            INCRBY key 0 → consumed = 1001 > 1000 → "rejected" → return false ✓
+
+check_instance_status(conf, ctx, "openai-p1-b")
+  → Step 2: get_tenant_limit_conf(conf, "openai-p1-b", "t-00000001") → 找到
+            INCRBY key 0 → consumed = 0 < 1000 → pass → return true ✓
+```
+
+---
+
+#### TC-F07: Tenant TPM 跨 Priority 降級
+
+**目的：** 同 priority 的所有 instance 的 tenant 配額都耗盡時，降級到低 priority instance。
+
+```bash
+# 把 priority=10 兩個 instance 的 tenant counter 全設滿
+TKEY_A="plugin-ai-rate-limiting<conf_id>#openai-p1-a#tenant#t-00000001:openai-p1-a#tenant#t-00000001"
+TKEY_B="plugin-ai-rate-limiting<conf_id>#openai-p1-b#tenant#t-00000001:openai-p1-b#tenant#t-00000001"
+redis-cli SET "$TKEY_A" 1001 EX 60
+redis-cli SET "$TKEY_B" 1001 EX 60
+
+curl -v -X POST http://apisix:9080/ai/chat \
+  -H "t-tenant-id: t-00000001" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}'
+```
+
+**預期：**
+- HTTP 200，打到 priority=5 的 `deepseek-p2`（其 tenant counter 尚未耗盡）
+- Response 含 `X-AI-RateLimit-Remaining-Tenant` 接近配置上限
+
+---
+
 ## 9. 已知限制與注意事項
 
 | 限制 | 說明 |
 |---|---|
 | LRU Cache 延遲 | `tenant_limit_conf_cache` TTL=300s，config 更新後配額設定最慢 5 分鐘後生效 |
 | 無 Tenant Header = 不限 Tenant | 若需要強制要求所有請求帶 tenant header，需在其他地方（如 `serverless-pre-function`）做驗證 |
-| Log Phase 非同步 | Access Phase 的 placeholder 與 Log Phase 的真實消耗之間有時間差；極短窗口內可能有微小的超限洩漏 |
+| Log Phase 非同步 | access phase 是純讀（cost=0），log phase 才寫入；高並發下同窗口內多個請求可能集體超限 |
 | Tenant ID 信任 | 插件直接信任 `t-tenant-id` header 的值，建議搭配 JWT / API Key 等認證機制確保 tenant ID 不被偽造 |
 | Redis 單點 | 若 Redis 故障，`allow_degradation: true`（預設）時 Fail-open 放行所有請求 |
 
@@ -1216,30 +1301,42 @@ ai_rate_limiting.check_instance_status(nil, ctx, instance_name)
 
 ### 12.4 Fallback 運作流程（覆蓋後）
 
+`check_instance_status` 現在同時檢查兩個維度，任一耗盡都會回傳 `false`：
+
 ```
-Request 進入 pick_target()
+Request 進入 pick_target()，帶有 t-tenant-id: t-00000001
         │
-        ├─ server_picker.get(ctx)  → instance_name = "openai-primary"
+        ├─ server_picker.get(ctx)  → instance_name = "openai-p1-a"
         │
-        │  require("apisix.plugins.ai-rate-limiting")
-        │  → 載入我們的 ai-rate-limiting.lua（非原生）
+        │  require("apisix.plugins.ai-rate-limiting")  → 載入我們的版本
         │
         ├─ Loop（最多 #instances 次）:
         │   │
-        │   ├─ check_instance_status(nil, ctx, "openai-primary")
-        │   │    conf == nil → 搜尋 ctx.plugins["ai-rate-limiting"] → 找到！
-        │   │    INCRBY key 0（cost=0，純讀）→ consumed > limit → return false
+        │   ├─ check_instance_status(nil, ctx, "openai-p1-a")
+        │   │    conf == nil → 搜尋 ctx.plugins["ai-rate-limiting"] → 找到
+        │   │    Step 1: instance limit_conf 存在？
+        │   │      → 有：INCRBY key 0 → consumed > limit → return false  (instance 滿)
+        │   │      → 無：跳過
+        │   │    Step 2: tenant_tpm 有設定？
+        │   │      → 有：get_tenant_limit_conf("openai-p1-a", "t-00000001")
+        │   │            INCRBY key 0 → consumed > limit → return false  (tenant 滿)
         │   │
-        │   ├─ server_picker.after_balance(ctx, true)  ← 標記失敗
-        │   ├─ server_picker.get(ctx)  → 同 priority 下一個 instance
+        │   ├─ return false → server_picker.after_balance(ctx, true)  ← 標記失敗
+        │   ├─ server_picker.get(ctx)  → 同 priority 下一個：openai-p1-b
         │   │
-        │   ├─ check_instance_status(nil, ctx, "openai-secondary")
-        │   │    → consumed < limit → return true → break
+        │   ├─ check_instance_status(nil, ctx, "openai-p1-b")
+        │   │    Step 2: get_tenant_limit_conf("openai-p1-b", "t-00000001")
+        │   │            → 獨立計數器，consumed = 0 < limit → pass
+        │   │    return true → break
         │
-        └─ return "openai-secondary", its_conf
+        └─ return "openai-p1-b", its_conf
+
+ctx.picked_ai_instance_name = "openai-p1-b"
+→ _M.access() 再次確認（最終閘門，同樣 cost=0）
+→ _M.log() 將 actual tokens 寫入 openai-p1-b 的計數器
 ```
 
-Priority 降級由 APISIX 內建的 `priority_balancer` 自動處理：同 priority 的所有 instance 皆 `false` 後，`server_picker.get()` 切換到下一個 priority group 繼續嘗試。測試驗證請參考 §8.7（TC-F01 ~ TC-F05）。
+Priority 降級由 APISIX 內建的 `priority_balancer` 自動處理：同 priority 的所有 instance 皆 `false` 後，`server_picker.get()` 切換到下一個 priority group 繼續嘗試。測試驗證請參考 §8.7（TC-F01 ~ TC-F07）。
 
 ---
 
