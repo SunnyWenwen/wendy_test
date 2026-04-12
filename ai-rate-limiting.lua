@@ -16,7 +16,8 @@
 --
 
 -- =============================================================================
--- ai-rate-limiting  (v5 — overrides upstream plugin; instance TPM optional)
+-- ai-rate-limiting  (v5 — overrides upstream plugin; instance TPM optional;
+--                         tenant TPM triggers fallback)
 --
 -- Deployment: place this file in a custom plugin directory and set
 --   extra_lua_path in config.yaml so Lua finds it before the built-in plugin.
@@ -29,6 +30,11 @@
 --     Redis key prefix changes to "plugin-ai-rate-limiting..."
 --   • Instance-level TPM (instances / limit+time_window) is now OPTIONAL.
 --     tenant_tpm alone is a valid configuration.
+--   • check_instance_status now checks BOTH instance and tenant TPM.
+--     When tenant TPM is exhausted on instance A, check_instance_status
+--     returns false → ai-proxy-multi falls back to instance B, where the
+--     same tenant may still have quota (independent per-instance counter).
+--     No changes to ai-proxy-multi.lua required.
 --   • Access phase Step 1 is skipped (not an error) when no instance-level
 --     limit_conf exists for the current AI instance.
 --   • Log phase continues to the tenant counter update even when there is no
@@ -423,12 +429,20 @@ end
 -- check_instance_status  (called by ai-proxy-multi for fallback_strategy)
 -- ---------------------------------------------------------------------------
 --
--- Returns true  → instance is available (counter below limit)
--- Returns false → instance TPM exhausted
+-- Returns true  → instance is available (all checked counters below limit)
+-- Returns false → instance or tenant TPM exhausted for this instance
 -- Returns nil, err → configuration error
 --
--- Uses cost=0: pure availability probe, no Redis write.
--- When conf is nil, searches ctx.plugins for this plugin's config.
+-- Checks both dimensions so either can trigger ai-proxy-multi fallback:
+--   1. Instance-level TPM (if instances / limit+time_window configured)
+--   2. Tenant-level TPM   (if tenant_tpm configured AND t-tenant-id header present)
+--
+-- Because tenant TPM is keyed per (instance, tenant), exhausting the tenant
+-- quota on "openai-p1-a" does NOT exhaust it on "openai-p1-b" — the fallback
+-- to another instance is meaningful and allows the tenant to be served by a
+-- different backend.
+--
+-- All checks use cost=0: pure Redis read (INCRBY key 0), no counter write.
 
 function _M.check_instance_status(conf, ctx, instance_name)
     if conf == nil then
@@ -454,19 +468,42 @@ function _M.check_instance_status(conf, ctx, instance_name)
         return nil, "invalid instance_name"
     end
 
+    -- Step 1: Instance-level TPM (skipped when not configured)
     local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
     local limit_conf     = limit_conf_kvs[instance_name]
-    if not limit_conf then
-        -- No instance-level limit configured → treat as available.
-        return true
+    if limit_conf then
+        local code, _ = limit_count.rate_limit(limit_conf, ctx, plugin_name, 0, false)
+        if code then
+            core.log.info(
+                "check_instance_status: instance TPM exhausted for ", instance_name
+            )
+            return false
+        end
     end
 
-    -- cost=0: INCRBY key 0 for Redis — read current consumed amount, no write.
-    local code, _ = limit_count.rate_limit(limit_conf, ctx, plugin_name, 0, false)
-    if code then
-        core.log.info("check_instance_status: TPM exhausted for ", instance_name)
-        return false
+    -- Step 2: Tenant-level TPM (skipped when not configured or no header)
+    -- tenant_id is readable from the request header at this point in the
+    -- access phase — ai-proxy-multi calls us before ctx.picked_ai_instance_name
+    -- is set, but ngx.var is already available.
+    if conf.tenant_tpm then
+        local tenant_id = ngx.var.http_t_tenant_id
+        if tenant_id and tenant_id ~= "" then
+            local tenant_limit_conf = get_tenant_limit_conf(conf, instance_name, tenant_id)
+            if tenant_limit_conf then
+                local t_code, _ = limit_count.rate_limit(
+                    tenant_limit_conf, ctx, plugin_name, 0, false
+                )
+                if t_code then
+                    core.log.info(
+                        "check_instance_status: tenant TPM exhausted",
+                        " instance: ", instance_name, " tenant: ", tenant_id
+                    )
+                    return false
+                end
+            end
+        end
     end
+
     return true
 end
 
