@@ -1190,153 +1190,56 @@ local tenant_limit_conf_cache = core.lrucache.new({ ttl = 300, count = 16384 })
 
 ---
 
-## 12. `fallback_strategy: ["rate_limiting"]` 與 `ai-proxy-multi` 整合問題
+## 12. `fallback_strategy: ["rate_limiting"]` 與 `ai-proxy-multi` 整合
 
-### 10.1 問題現象
+### 12.1 問題現象（歷史背景）
 
-配置 `ai-proxy-multi` 的 `fallback_strategy: ["rate_limiting"]` 搭配 `ai-rate-limiting-redis` 後，Instance A 的 TPM 耗盡時不會自動 fallback 到 Instance B，所有請求仍然打到已超限的 instance。
+舊版本命名為 `ai-rate-limiting-redis` 時，`ai-proxy-multi` 的 `fallback_strategy: ["rate_limiting"]` 完全失效——Instance A TPM 耗盡後不會切換到 Instance B。
 
-### 10.2 根本原因
+### 12.2 根本原因
 
-`ai-proxy-multi.lua`（APISIX 3.15 原生）的 `pick_target()` 函數**硬編碼**載入 `ai-rate-limiting`：
+`ai-proxy-multi.lua` 硬編碼載入原生 plugin：
 
 ```lua
--- ai-proxy-multi.lua ~line 376 (原始碼)
+-- ai-proxy-multi.lua ~line 376
 local ai_rate_limiting = require("apisix.plugins.ai-rate-limiting")
-...
-for _ = 1, #conf.instances do
-    if ai_rate_limiting.check_instance_status(nil, ctx, instance_name) then
-        break
-    end
-    ...
-end
+ai_rate_limiting.check_instance_status(nil, ctx, instance_name)
 ```
 
-`check_instance_status(nil, ctx, instance_name)` 收到 `conf = nil` 時，會自行到 `ctx.plugins` 搜尋 `name == "ai-rate-limiting"` 的 plugin config：
+`check_instance_status(nil, ...)` 在 `ctx.plugins` 裡搜尋 `name == "ai-rate-limiting"`，但當時配置的是 `"ai-rate-limiting-redis"` → 永遠找不到 conf → 永遠回傳 `true`（available）→ fallback 不觸發。
 
-```lua
--- ai-rate-limiting.lua check_instance_status 的 conf 探測邏輯
-if conf == nil then
-    for i = 1, #ctx.plugins, 2 do
-        if ctx.plugins[i]["name"] == plugin_name then  -- "ai-rate-limiting"
-            conf = ctx.plugins[i + 1]
-        end
-    end
-end
-if not conf then
-    return true   -- ← 找不到 → 永遠回傳 "可用"
-end
-```
+### 12.3 解法：覆蓋原生 plugin（已於 §5 實施）
 
-| 步驟 | 搜尋的名稱 | 實際配置的名稱 | 結果 |
-|---|---|---|---|
-| require | `"ai-rate-limiting"` | — | 載入**原生** plugin 模組 |
-| conf 探測 | `"ai-rate-limiting"` | `"ai-rate-limiting-redis"` | **找不到** conf |
-| check 結果 | — | — | 永遠 `true`（available）|
-| fallback | — | — | **永遠不觸發** |
+**不需要修改 `ai-proxy-multi.lua`。**
 
-### 10.3 修正方式
+將自訂 plugin 命名為 `ai-rate-limiting`（與原生相同），透過 `config.yaml` 的 `extra_lua_path` 讓 Lua 優先載入自訂版本。`ai-proxy-multi` 的 `require("apisix.plugins.ai-rate-limiting")` 就自然載入到我們的實作，`check_instance_status` 也能正確找到 conf。
 
-**只需修改 `ai-proxy-multi.lua` 一處**，將硬編碼改為動態查找當前 route 實際配置的 rate-limiting plugin，並直接傳入 conf（避免函數內二次搜尋）：
-
-**diff** (`apisix/plugins/ai-proxy-multi.lua`)：
-```diff
-     if conf.fallback_strategy == "instance_health_and_rate_limiting" or
-        fallback_strategy_has(conf.fallback_strategy, "rate_limiting") then
--        local ai_rate_limiting = require("apisix.plugins.ai-rate-limiting")
-+        -- Dynamically discover which rate-limiting plugin is active for this route.
-+        -- Supports "ai-rate-limiting" (built-in) and custom variants such as
-+        -- "ai-rate-limiting-redis". Passing conf directly avoids a redundant
-+        -- ctx.plugins scan inside check_instance_status.
-+        local rl_mod, rl_conf
-+        local route_plugins = ctx.plugins
-+        local rl_candidates = { "ai-rate-limiting-redis", "ai-rate-limiting" }
-+        for _, pname in ipairs(rl_candidates) do
-+            for i = 1, #route_plugins, 2 do
-+                if route_plugins[i]["name"] == pname then
-+                    local ok, mod = pcall(require, "apisix.plugins." .. pname)
-+                    if ok and mod.check_instance_status then
-+                        rl_mod  = mod
-+                        rl_conf = route_plugins[i + 1]
-+                        break
-+                    end
-+                end
-+            end
-+            if rl_mod then break end
-+        end
-+        -- Fallback: load base plugin and pass nil conf (original behaviour)
-+        if not rl_mod then
-+            rl_mod = require("apisix.plugins.ai-rate-limiting")
-+        end
-         for _ = 1, #conf.instances do
--            if ai_rate_limiting.check_instance_status(nil, ctx, instance_name) then
-+            if rl_mod.check_instance_status(rl_conf, ctx, instance_name) then
-                 break
-             end
-```
-
-patch 檔案位置：`ai-proxy-multi.patch`
-
-### 10.4 修正後的完整 Fallback 流程
+### 12.4 Fallback 運作流程（覆蓋後）
 
 ```
 Request 進入 pick_target()
         │
         ├─ server_picker.get(ctx)  → instance_name = "openai-primary"
         │
-        │  [修正後的 rl_mod / rl_conf 查找]
-        │  rl_candidates = { "ai-rate-limiting-redis", "ai-rate-limiting" }
-        │  → 找到 "ai-rate-limiting-redis" in ctx.plugins → rl_conf = 其設定
+        │  require("apisix.plugins.ai-rate-limiting")
+        │  → 載入我們的 ai-rate-limiting.lua（非原生）
         │
         ├─ Loop（最多 #instances 次）:
         │   │
-        │   ├─ rl_mod.check_instance_status(rl_conf, ctx, "openai-primary")
-        │   │    → conf 已知（不需 nil 探測）
-        │   │    → limit_conf_kvs["openai-primary"].count 耗盡 → return false
+        │   ├─ check_instance_status(nil, ctx, "openai-primary")
+        │   │    conf == nil → 搜尋 ctx.plugins["ai-rate-limiting"] → 找到！
+        │   │    INCRBY key 0（cost=0，純讀）→ consumed > limit → return false
         │   │
-        │   ├─ server_picker.after_balance(ctx, true)  ← 標記 openai-primary 失敗
+        │   ├─ server_picker.after_balance(ctx, true)  ← 標記失敗
         │   ├─ server_picker.get(ctx)  → 同 priority 下一個 instance
         │   │
-        │   ├─ rl_mod.check_instance_status(rl_conf, ctx, "openai-secondary")
-        │   │    → 有餘量 → return true → break
-        │   │
+        │   ├─ check_instance_status(nil, ctx, "openai-secondary")
+        │   │    → consumed < limit → return true → break
         │
         └─ return "openai-secondary", its_conf
 ```
 
-**Priority 降級**：當同一 priority group 內所有 instance 都回傳 `false`（TPM 耗盡）時，`server_picker.get()` 會自動切換到下一個 priority group（APISIX `priority_balancer` 的內建行為），繼續做 `check_instance_status` 驗證，直到找到可用 instance 或超過 `#conf.instances` 次。
-
-### 10.5 `ai-rate-limiting-redis.lua` 是否需要修改？
-
-**不需要**。`check_instance_status` 的邏輯本身正確：
-- 修正後 `rl_conf` 直接傳入，跳過 `ctx.plugins` 搜尋
-- `limit_count.rate_limit(..., 1, true)` 做 placeholder +1；rate-limited 時立即 restore -1
-- 函數完全相容 `ai-proxy-multi` 的呼叫規約
-
-### 10.6 測試驗證
-
-```bash
-# 把 openai-primary 的 TPM counter 設滿（模擬耗盡）
-INST_KEY="plugin-ai-rate-limiting<conf_id>#openai-primary:openai-primary"
-redis-cli SET "$INST_KEY" 0 EX 60
-
-# 發送請求，應自動 fallback 到 openai-secondary（或下一 priority instance）
-curl -v -X POST http://apisix:9080/ai/chat \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}'
-
-# 預期：
-# - HTTP 200（非 429）
-# - X-AI-RateLimit-Limit-openai-secondary: <limit>  （表示打到了 secondary）
-# - openai-primary counter 未增加（check_instance_status 發現耗盡後 restore -1）
-
-# 驗證 openai-primary 未被額外消耗
-redis-cli GET "$INST_KEY"   # 仍為 0（check restore 後無淨消耗）
-
-# 驗證 secondary 有消耗
-SEC_KEY="plugin-ai-rate-limiting<conf_id>#openai-secondary:openai-secondary"
-redis-cli GET "$SEC_KEY"    # 應有 placeholder -1，log phase 後為 (limit - actual_tokens)
-```
+Priority 降級由 APISIX 內建的 `priority_balancer` 自動處理：同 priority 的所有 instance 皆 `false` 後，`server_picker.get()` 切換到下一個 priority group 繼續嘗試。測試驗證請參考 §8.7（TC-F01 ~ TC-F05）。
 
 ---
 
@@ -1346,4 +1249,3 @@ redis-cli GET "$SEC_KEY"    # 應有 placeholder -1，log phase 後為 (limit - 
 - [APISIX limit-count plugin source](https://github.com/apache/apisix/blob/master/apisix/plugins/limit-count/init.lua)
 - [APISIX lrucache API](https://github.com/apache/apisix/blob/master/apisix/core/lrucache.lua)
 - [ngx.var.http_* 變數說明](https://nginx.org/en/docs/http/ngx_http_core_module.html#var_http_)
-- [ai-proxy-multi fallback patch](./ai-proxy-multi.patch)
