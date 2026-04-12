@@ -65,8 +65,8 @@
 │  Log Phase (ngx.timer)                                           │
 │                                                                  │
 │  同時更新：                                                       │
-│    ① Instance counter        INCRBY "<conf_id>#openai-primary:..."       (N-1)  │
-│    ② Tenant×Instance counter INCRBY "<conf_id>#openai-primary#tenant#...:..." (N-1)  │
+│    ① Instance counter        INCRBY "<conf_id>#openai-primary:..."       (N)  │
+│    ② Tenant×Instance counter INCRBY "<conf_id>#openai-primary#tenant#...:..." (N)  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -109,23 +109,23 @@ Request with header:  t-tenant-id: t-12345678
                ┌──────────────▼──────────────────┐
                │  STEP 1: Instance TPM check                              │
                │  group = "<conf_id>#openai-primary"                  │
-               │  INCRBY key 1 (placeholder)      │
+               │  INCRBY key 0 (pure read)        │
                └──────────────┬──────────────────┘
                               │
                ┌──────────────▼──────────────────┐  instance 超限
                │  remaining >= 0 ?               ├──────────────────────►  429 / 503
-               └──────────────┬──────────────────┘  restore instance +1
+               └──────────────┬──────────────────┘
                               │ OK
                ┌──────────────▼──────────────────┐
                │  STEP 2: Tenant TPM check                                │  (只有 tenant_tpm 設定時才執行)
                │  group = "<conf_id>#openai-primary#tenant#t-12345678" │
-               │  INCRBY key 1 (placeholder)      │
+               │  INCRBY key 0 (pure read)        │
                └──────────────┬──────────────────┘
                               │
                ┌──────────────▼──────────────────┐  tenant 超限
                │  remaining >= 0 ?               ├──────────────────────►  429 / 503
-               └──────────────┬──────────────────┘  restore instance +1
-                              │ OK               restore tenant +1
+               └──────────────┬──────────────────┘
+                              │ OK
                               │
                ctx.ai_tenant_id = "t-12345678"
                               │
@@ -140,10 +140,9 @@ Request with header:  t-tenant-id: t-12345678
                               │
                ┌──────────────▼──────────────────┐
                │  actual_tokens = 847             │
-               │  extra = 847 - 1 = 846           │
                │                                  │
-               │  INCRBY "<conf_id>#openai-primary:openai-primary"                 +846  │
-               │  INCRBY "<conf_id>#openai-primary#tenant#t-12345678:..."      +846  │
+               │  INCRBY "<conf_id>#openai-primary:openai-primary"                 +847  │
+               │  INCRBY "<conf_id>#openai-primary#tenant#t-12345678:..."      +847  │
                └──────────────────────────────────┘
 ```
 
@@ -295,8 +294,8 @@ ctx.ai_token_usage = {
 |---|---|---|
 | `ctx.ai_token_usage` 設定時機 | 完整 response body 解析後 | 最後一個含 usage 的 SSE chunk 解析後 |
 | `stream_options` | N/A | APISIX 自動注入 `include_usage: true` |
-| Access Phase（placeholder +1） | 正常 | 正常（串流開始前即扣） |
-| Log Phase（actual - 1 調整） | 正常 | 正常（串流結束、log 觸發時執行） |
+| Access Phase（cost=0，pure read） | 正常 | 正常（串流開始前純讀取） |
+| Log Phase（寫入 actual tokens） | 正常 | 正常（串流結束、log 觸發時執行） |
 | Tenant counter 更新 | 正常 | 正常 |
 
 #### 邊緣情況：Provider 不支援 streaming usage
@@ -304,10 +303,9 @@ ctx.ai_token_usage = {
 若 LLM provider 不回傳 `usage` 欄位（未遵循 `stream_options`），`ctx.ai_token_usage` 為 nil，log phase 會：
 
 1. 記錄 error log：`"failed to get token usage for llm service"`
-2. 提前 return，不執行 extra_tokens 調整
-3. Access phase 預扣的 `+1` placeholder **不會被校正** → counter 每次串流請求偏移 `+1`
+2. 提前 return，不執行 token 扣減
 
-此行為與上游 `ai-rate-limiting` plugin 一致，並非本 plugin 引入的問題。
+由於 access phase 使用 `cost=0`（pure read，不寫入），log phase 若提前 return 也不會有 counter 漂移問題。
 
 ---
 
@@ -637,7 +635,7 @@ curl -X POST http://apisix:9080/ai/chat \
 **預期：**
 - HTTP 200
 - `X-AI-RateLimit-Limit-Tenant: 1000`
-- `X-AI-RateLimit-Remaining-Tenant: 999`（access phase 扣 1 placeholder）
+- `X-AI-RateLimit-Remaining-Tenant: 1000`（access phase 不扣，log phase 才寫入）
 
 **驗證：**
 ```bash
@@ -645,9 +643,9 @@ curl -X POST http://apisix:9080/ai/chat \
 redis-cli KEYS "plugin-ai-rate-limiting*openai-primary#tenant#t-99999999*"
 # ex: "plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 
-# 確認 TTL = 60 秒、餘額為 999（placeholder -1）
+# 確認 TTL = 60 秒；access phase 不寫入，key 由 log phase timer 建立
 redis-cli TTL  "plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"  # 接近 60
-redis-cli GET  "plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"  # 999
+redis-cli GET  "plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"  # = actual_tokens（log phase 寫入後）
 ```
 
 ---
@@ -711,14 +709,14 @@ curl -v -X POST http://apisix:9080/ai/chat \
 **預期：**
 - HTTP 429
 - Body: `TPM rate limit exceeded`
-- Instance counter 未被消耗（placeholder 已還原）
+- Instance counter 未被消耗（access phase cost=0，不寫入）
 
 **驗證：**
 ```bash
 INST_KEY="plugin-ai-rate-limiting<conf_id>#openai-primary:openai-primary"
 TENANT_KEY="plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-00000002:openai-primary#tenant#t-00000002"
-redis-cli GET "$INST_KEY"    # 應維持超限前的值（placeholder 已還原）
-redis-cli GET "$TENANT_KEY"  # 應為 0 或 -1（INCRBY 後 restore）
+redis-cli GET "$INST_KEY"    # 應維持超限前的值（access phase 未寫入）
+redis-cli GET "$TENANT_KEY"  # 應為模擬設定的 0（INCRBY key 0 不修改，請求被拒絕後 log phase 不執行）
 ```
 
 ---
@@ -744,12 +742,12 @@ curl -X POST http://apisix:9080/ai/chat \
 KEY_A="plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-00000001:openai-primary#tenant#t-00000001"
 KEY_B="plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 
-redis-cli GET "$KEY_A"   # 接近 4999（5000 - 1 placeholder）
-redis-cli GET "$KEY_B"   # 接近 999（1000 - 1 placeholder）
+redis-cli GET "$KEY_A"   # log phase 執行後 = actual_tokens_A（access phase 不寫入）
+redis-cli GET "$KEY_B"   # log phase 執行後 = actual_tokens_B
 
 # 等待 LLM 回應後（log phase timer 執行後）：
-# KEY_A = 5000 - actual_tokens_A
-# KEY_B = 1000 - actual_tokens_B
+# KEY_A = actual_tokens_A（consumed，非剩餘）
+# KEY_B = actual_tokens_B
 ```
 
 ---
@@ -799,13 +797,13 @@ done
 ```
 TENANT_KEY = "plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 
-初始:          TENANT_KEY = 1000
-請求 1 access: TENANT_KEY = 999  (佔位 -1)
-請求 1 log:    TENANT_KEY = 901  (再扣 99 = actual 100 - placeholder 1)
-請求 2 access: TENANT_KEY = 900
-請求 2 log:    TENANT_KEY = 801
-請求 3 access: TENANT_KEY = 800
-請求 3 log:    TENANT_KEY = 701
+初始:          TENANT_KEY = 0（key 不存在）
+請求 1 access: TENANT_KEY = 0（cost=0，pure read，不寫入）
+請求 1 log:    TENANT_KEY = 100（INCRBY +100，actual tokens）
+請求 2 access: TENANT_KEY = 100（pure read）
+請求 2 log:    TENANT_KEY = 200（INCRBY +100）
+請求 3 access: TENANT_KEY = 200（pure read）
+請求 3 log:    TENANT_KEY = 300（INCRBY +100）
 ```
 
 **驗證：**
