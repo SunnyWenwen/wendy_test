@@ -54,6 +54,7 @@ local ipairs         = ipairs
 local type           = type
 local core           = require("apisix.core")
 local limit_count    = require("apisix.plugins.limit-count.init")
+local redis_utils    = require("apisix.utils.redis")
 local redis_schema   = require("apisix.utils.redis-schema")
 local policy_to_additional_properties = redis_schema.schema
 
@@ -187,6 +188,93 @@ local tenant_limit_conf_cache = core.lrucache.new({ ttl = 300, count = 4096 })
 -- ---------------------------------------------------------------------------
 -- Schema validation
 -- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- check_limit_available: read-only capacity check, no token consumed
+-- ---------------------------------------------------------------------------
+--
+-- Problem: limit-count-redis.lua Lua script asserts `cost >= 1`.
+--   Calling rate_limit(..., 0, false) for Redis causes an assert error in Redis.
+--   With allow_degradation=true (schema default) this error is swallowed silently
+--   and every request passes unchecked — the counter only moves in the log phase,
+--   so it drifts negative with no gate.
+--
+-- Fix by policy:
+--   local  — rate_limit with cost=1, dry_run=true (commit=false).
+--            cost=0 would never reject at the "remaining=0" boundary;
+--            cost=1+dry_run correctly rejects when remaining <= 0.
+--   redis  — direct Redis GET on the key that limit-count-redis constructs:
+--            "plugin-" + plugin_name + group + ":" + key
+--            remaining <= 0  → exhausted → return rejected_code
+--            key absent      → fresh window → pass
+--
+-- Returns: code (nil = pass), body
+local function check_limit_available(limit_conf, ctx)
+    if not limit_conf.policy or limit_conf.policy == "local" then
+        -- dry_run=true → commit=false; counter is never written
+        return limit_count.rate_limit(limit_conf, ctx, plugin_name, 1, true)
+    end
+
+    -- Redis policy: bypass the script's `assert(cost >= 1)` with a direct GET.
+    -- Key format mirrors limit-count-redis.lua line 65:
+    --   key = self.plugin_name .. tostring(key)
+    -- where self.plugin_name = "plugin-" + plugin_name  and
+    --       key              = gen_limit_key result = group + ":" + conf.key
+    local redis_key = "plugin-" .. plugin_name .. limit_conf.group .. ":" .. limit_conf.key
+
+    local red, conn_err = redis_utils.new(limit_conf)
+    if not red then
+        core.log.error("check_limit_available: Redis connect failed: ", conn_err)
+        if limit_conf.allow_degradation then return nil end
+        return 500, { error_msg = "Redis connection failed" }
+    end
+
+    local val, get_err = red:get(redis_key)
+    red:set_keepalive(
+        limit_conf.redis_keepalive_timeout,
+        limit_conf.redis_keepalive_pool
+    )
+
+    if get_err then
+        core.log.error("check_limit_available: Redis GET failed: ", get_err)
+        if limit_conf.allow_degradation then return nil end
+        return 500, { error_msg = "Redis GET failed" }
+    end
+
+    -- Key absent → no usage in this window → pass
+    if val == ngx.null or val == nil then
+        if limit_conf.show_limit_quota_header then
+            core.response.set_header(
+                limit_conf.limit_header,     limit_conf.count,
+                limit_conf.remaining_header, limit_conf.count
+            )
+        end
+        return nil
+    end
+
+    local remaining = tonumber(val)
+    if not remaining or remaining <= 0 then
+        if limit_conf.show_limit_quota_header then
+            core.response.set_header(
+                limit_conf.limit_header,     limit_conf.count,
+                limit_conf.remaining_header, 0
+            )
+        end
+        if limit_conf.rejected_msg then
+            return limit_conf.rejected_code, { error_msg = limit_conf.rejected_msg }
+        end
+        return limit_conf.rejected_code
+    end
+
+    -- Pass: expose current remaining in header
+    if limit_conf.show_limit_quota_header then
+        core.response.set_header(
+            limit_conf.limit_header,     limit_conf.count,
+            limit_conf.remaining_header, remaining
+        )
+    end
+    return nil
+end
 
 function _M.check_schema(conf)
     return core.schema.check(schema, conf)
@@ -377,7 +465,7 @@ function _M.access(conf, ctx)
     local limit_conf     = limit_conf_kvs[ai_instance_name]
 
     if limit_conf then
-        local code, msg = limit_count.rate_limit(limit_conf, ctx, plugin_name, 0, false)
+        local code, msg = check_limit_available(limit_conf, ctx)
         if code then
             core.log.info(
                 "instance TPM exceeded: ", ai_instance_name, " code: ", code
@@ -399,9 +487,7 @@ function _M.access(conf, ctx)
             local tenant_limit_conf = get_tenant_limit_conf(conf, ai_instance_name, tenant_id)
 
             if tenant_limit_conf then
-                local t_code, t_msg = limit_count.rate_limit(
-                    tenant_limit_conf, ctx, plugin_name, 0, false
-                )
+                local t_code, t_msg = check_limit_available(tenant_limit_conf, ctx)
                 if t_code then
                     core.log.info(
                         "tenant TPM exceeded: ", tenant_id,
@@ -472,7 +558,7 @@ function _M.check_instance_status(conf, ctx, instance_name)
     local limit_conf_kvs = limit_conf_cache(conf, nil, fetch_limit_conf_kvs, conf)
     local limit_conf     = limit_conf_kvs[instance_name]
     if limit_conf then
-        local code, _ = limit_count.rate_limit(limit_conf, ctx, plugin_name, 0, false)
+        local code, _ = check_limit_available(limit_conf, ctx)
         if code then
             core.log.info(
                 "check_instance_status: instance TPM exhausted for ", instance_name
@@ -490,9 +576,7 @@ function _M.check_instance_status(conf, ctx, instance_name)
         if tenant_id and tenant_id ~= "" then
             local tenant_limit_conf = get_tenant_limit_conf(conf, instance_name, tenant_id)
             if tenant_limit_conf then
-                local t_code, _ = limit_count.rate_limit(
-                    tenant_limit_conf, ctx, plugin_name, 0, false
-                )
+                local t_code, _ = check_limit_available(tenant_limit_conf, ctx)
                 if t_code then
                     core.log.info(
                         "check_instance_status: tenant TPM exhausted",

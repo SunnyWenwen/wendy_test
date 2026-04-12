@@ -109,22 +109,22 @@ Request with header:  t-tenant-id: t-12345678
                ┌──────────────▼──────────────────┐
                │  STEP 1: Instance TPM check                              │
                │  group = "<conf_id>#openai-primary"                  │
-               │  INCRBY key 0 (pure read)        │
+               │  GET key  (direct read, no write)│
                └──────────────┬──────────────────┘
                               │
                ┌──────────────▼──────────────────┐  instance 超限
-               │  remaining >= 0 ?               ├──────────────────────►  429 / 503
-               └──────────────┬──────────────────┘
+               │  key absent OR remaining > 0 ?  ├──────────────────────►  429 / 503
+               └──────────────┬──────────────────┘  (remaining <= 0)
                               │ OK
                ┌──────────────▼──────────────────┐
                │  STEP 2: Tenant TPM check                                │  (只有 tenant_tpm 設定時才執行)
                │  group = "<conf_id>#openai-primary#tenant#t-12345678" │
-               │  INCRBY key 0 (pure read)        │
+               │  GET key  (direct read, no write)│
                └──────────────┬──────────────────┘
                               │
                ┌──────────────▼──────────────────┐  tenant 超限
-               │  remaining >= 0 ?               ├──────────────────────►  429 / 503
-               └──────────────┬──────────────────┘
+               │  key absent OR remaining > 0 ?  ├──────────────────────►  429 / 503
+               └──────────────┬──────────────────┘  (remaining <= 0)
                               │ OK
                               │
                ctx.ai_tenant_id = "t-12345678"
@@ -294,7 +294,7 @@ ctx.ai_token_usage = {
 |---|---|---|
 | `ctx.ai_token_usage` 設定時機 | 完整 response body 解析後 | 最後一個含 usage 的 SSE chunk 解析後 |
 | `stream_options` | N/A | APISIX 自動注入 `include_usage: true` |
-| Access Phase（cost=0，pure read） | 正常 | 正常（串流開始前純讀取） |
+| Access Phase（direct GET，pure read） | 正常 | 正常（串流開始前純讀取） |
 | Log Phase（寫入 actual tokens） | 正常 | 正常（串流結束、log 觸發時執行） |
 | Tenant counter 更新 | 正常 | 正常 |
 
@@ -305,7 +305,7 @@ ctx.ai_token_usage = {
 1. 記錄 error log：`"failed to get token usage for llm service"`
 2. 提前 return，不執行 token 扣減
 
-由於 access phase 使用 `cost=0`（pure read，不寫入），log phase 若提前 return 也不會有 counter 漂移問題。
+由於 access phase 使用 direct GET（pure read，不寫入），log phase 若提前 return 也不會有 counter 漂移問題。
 
 ---
 
@@ -415,93 +415,104 @@ volumeMounts:
 
 ---
 
-## 6. limit-count 內部機制與 INCRBY 分析
+## 6. limit-count 內部機制與 Redis 儲存模型分析
 
-### 6.1 limit-count 的核心：固定時間窗口計數器
+### 6.1 limit-count-redis.lua 的實際行為
 
-APISIX `limit-count` 使用 **固定時間窗口（Fixed Window）** 算法，Redis 儲存每個窗口的**已消耗量（consumed amount）**：
-
-```
-初始狀態：key 不存在（或 = 0）
-每次請求：INCRBY key cost  →  若新值 > limit  →  拒絕
-窗口結束：TTL 到期，key 自動消失，新窗口從 0 開始
-```
-
-### 6.2 Redis Script（偽碼）
+`limit-count-redis.lua` 使用 **固定時間窗口（Fixed Window）** 算法。與常見認知不同，Redis 儲存的是**剩餘量（remaining）**，而非已消耗量：
 
 ```lua
--- limit-count-redis.lua 底層執行的 Redis 操作（簡化）
-local current = redis.call("INCRBY", key, cost)     -- 累加消耗量
-if current == cost then
-    -- 第一次寫入，設定 TTL（time_window 秒）
-    redis.call("EXPIRE", key, time_window)
+-- limit-count-redis.lua 底層 Redis Lua script（實際節錄）
+assert(tonumber(ARGV[3]) >= 1, "cost must be at least 1")   -- ← cost=0 被禁止
+local ttl = redis.call('ttl', KEYS[1])
+if ttl < 0 then
+    -- 第一次：SET key (limit - cost) EX window → 直接初始化為剩餘量
+    redis.call('set', KEYS[1], ARGV[1] - ARGV[3], 'EX', ARGV[2])
+    return {ARGV[1] - ARGV[3], ARGV[2]}
 end
-if current > limit then
-    return {nil, "rejected", ttl}                   -- 超限
-end
-local remaining = limit - current
-return {0, remaining, ttl}                           -- 通過，回傳剩餘量
+-- 後續：INCRBY key (0 - cost) = DECRBY cost → 剩餘量遞減
+return {redis.call('incrby', KEYS[1], 0 - ARGV[3]), ttl}
 ```
 
-### 6.3 Redis 存的是「已消耗量」還是「剩餘量」？
+### 6.2 Redis 存的是「剩餘量（remaining）」
 
-**結論：Redis 存的是已消耗量（consumed），剩餘量由 Lua 計算得出。**
-
-```
-Redis 儲存：consumed（從 0 開始遞增）
-判斷邏輯：if consumed > limit → rejected
-回傳剩餘：remaining = limit - consumed
-```
-
-**為什麼存已消耗量更合理：**
-
-| | 存已消耗量（現行）| 存剩餘量 |
-|---|---|---|
-| 初始值 | 0（key 不存在）| limit（需要初始化）|
-| 每次操作 | `INCRBY key cost`（原子，簡單）| `DECRBY key cost`（需先確保 key 存在）|
-| 原子性 | ✓ INCRBY 天然原子 | ✗ 初始化 + DECRBY 需要 Lua script 保護 |
-| TTL 設定 | 第一次 INCRBY 後設 EXPIRE | 需在 key 不存在時先 SET limit，再設 EXPIRE |
-| 判斷超限 | `if value > limit` | `if value < 0` |
-
-存已消耗量的做法讓 Redis 操作更簡單，也讓 `INCRBY 0`（cost=0）成為天然的純讀操作。
-
-### 6.4 cost=0 的特殊意義
+**結論：Redis key 的值 = 剩餘可用 tokens（從 limit 倒數至負數）。**
 
 ```
-INCRBY key 0
-→ 不改變 consumed 值
-→ Redis 回傳當前 consumed 值
-→ Lua: if consumed > limit → rejected (already exhausted)
-→ 等效於：「在不消耗任何配額的情況下，查看當前是否還有餘量」
+key 不存在      → 新窗口，尚未使用任何配額
+key 值 > 0      → 還有餘量，可繼續服務
+key 值 = 0      → 恰好用完，下一請求超限
+key 值 < 0      → 已超限（窗口內允許的最後一批請求讓值穿越零點）
 ```
 
-這正是本 plugin access phase 與 `check_instance_status` 的實作原理——純讀，access phase 完全不寫入 Redis，讓計數準確反映真實 token 消耗。
+操作對照：
+
+| | 實際行為 |
+|---|---|
+| 初次寫入 | `SET key (limit - cost) EX window` |
+| 後續寫入 | `INCRBY key (0 - cost)`（即 DECRBY cost）|
+| 判斷超限 | `if remaining < 0 → rejected`（原生 limit-count）|
+| TTL 到期 | key 消失 → 新窗口，值重置 |
+
+### 6.3 為何 cost=0 在 Redis 不可行
+
+原生 script 第一行：
+```lua
+assert(tonumber(ARGV[3]) >= 1, "cost must be at least 1")
+```
+
+若呼叫 `rate_limit(conf, ctx, plugin_name, 0, false)` 傳入 cost=0：
+- Redis Lua script 拋出 assert 錯誤 `"cost must be at least 1"`
+- Lua 收到 err 回傳，進入 error path
+- `allow_degradation = true`（schema 預設）→ **錯誤被靜默吞掉，請求直接放行**
+- access phase 形同不存在，所有請求都通過；counter 只在 log phase 遞減
+- **結果：counter 無限往負數走，超限請求完全不被卡住**
+
+這正是「tenant TPM 超過仍然放行」的根本原因。
+
+### 6.4 修正方案：Access Phase 改用 direct Redis GET
+
+由於 `cost=0` 無法使用，access phase 和 `check_instance_status` 改以直接 Redis GET 替代：
+
+```
+GET key
+→ key 不存在：fresh window → pass（尚無消耗）
+→ key 值 > 0：還有餘量 → pass
+→ key 值 ≤ 0：配額耗盡 → reject（returned rejected_code）
+```
+
+比較原來的 `INCRBY key 0`，direct GET：
+- 不觸發 `assert(cost >= 1)` — 不會被 script 拒絕
+- 完全不修改 Redis 值 — 真正的純讀操作
+- 正確偵測 `remaining = 0`（恰好用完，也應拒絕）
 
 ### 6.5 完整計數流程
 
 ```
-時間窗口 60 秒，limit = 10,000 tokens
+時間窗口 60 秒，limit = 10,000 tokens（remaining 模型）
 
 Request 1（實際消耗 500 tokens）：
-  Access phase:  INCRBY key 0   → consumed = 0   → pass（0 < 10000）
-  Log phase:     INCRBY key 500 → consumed = 500
+  Access phase:  GET key → nil（key 不存在，fresh window） → pass
+  Log phase:     SET key (10000 - 500) EX 60 → remaining = 9500
 
 Request 2（實際消耗 800 tokens）：
-  Access phase:  INCRBY key 0   → consumed = 500 → pass（500 < 10000）
-  Log phase:     INCRBY key 800 → consumed = 1300
+  Access phase:  GET key → 9500 > 0 → pass
+  Log phase:     INCRBY key -800 → remaining = 8700
 
-... 累積到 consumed = 9800 ...
+... 繼續消耗直到 remaining = 200 ...
 
 Request N（實際消耗 300 tokens）：
-  Access phase:  INCRBY key 0   → consumed = 9800 → pass（9800 < 10000）
-  Log phase:     INCRBY key 300 → consumed = 10100
+  Access phase:  GET key → 200 > 0 → pass
+  Log phase:     INCRBY key -300 → remaining = -100（穿越零點）
 
 Request N+1：
-  Access phase:  INCRBY key 0   → consumed = 10100 → REJECTED（10100 > 10000）
-  （log phase 不執行，因為 ctx.ai_rate_limiting = true）
+  Access phase:  GET key → -100 ≤ 0 → REJECTED
+  （log phase 不執行，ctx.ai_rate_limiting = true）
 
-TTL 到期 → key 消失 → 新窗口從 0 開始
+TTL 到期 → key 消失 → 新窗口，從頭開始
 ```
+
+> **注意**：Redis 模擬「耗盡」狀態時應使用 `redis-cli SET key -1 EX 60`（remaining = -1），而非設成大於 limit 的正數（那樣反而代表「尚有大量剩餘」）。
 
 ---
 
@@ -709,14 +720,14 @@ curl -v -X POST http://apisix:9080/ai/chat \
 **預期：**
 - HTTP 429
 - Body: `TPM rate limit exceeded`
-- Instance counter 未被消耗（access phase cost=0，不寫入）
+- Instance counter 未被消耗（access phase direct GET，不寫入）
 
 **驗證：**
 ```bash
 INST_KEY="plugin-ai-rate-limiting<conf_id>#openai-primary:openai-primary"
 TENANT_KEY="plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-00000002:openai-primary#tenant#t-00000002"
 redis-cli GET "$INST_KEY"    # 應維持超限前的值（access phase 未寫入）
-redis-cli GET "$TENANT_KEY"  # 應為模擬設定的 0（INCRBY key 0 不修改，請求被拒絕後 log phase 不執行）
+redis-cli GET "$TENANT_KEY"  # 應為模擬設定的 0（direct GET 不寫入；請求被拒絕後 log phase 不執行）
 ```
 
 ---
@@ -797,13 +808,13 @@ done
 ```
 TENANT_KEY = "plugin-ai-rate-limiting<conf_id>#openai-primary#tenant#t-99999999:openai-primary#tenant#t-99999999"
 
-初始:          TENANT_KEY = 0（key 不存在）
-請求 1 access: TENANT_KEY = 0（cost=0，pure read，不寫入）
-請求 1 log:    TENANT_KEY = 100（INCRBY +100，actual tokens）
-請求 2 access: TENANT_KEY = 100（pure read）
-請求 2 log:    TENANT_KEY = 200（INCRBY +100）
-請求 3 access: TENANT_KEY = 200（pure read）
-請求 3 log:    TENANT_KEY = 300（INCRBY +100）
+初始:          TENANT_KEY = nil（key 不存在）
+請求 1 access: GET key → nil → pass（direct GET，不寫入）
+請求 1 log:    SET key (1000-100) EX 60  → TENANT_KEY = 900（剩餘 remaining）
+請求 2 access: GET key → 900 > 0 → pass
+請求 2 log:    INCRBY key -100  → TENANT_KEY = 800
+請求 3 access: GET key → 800 > 0 → pass
+請求 3 log:    INCRBY key -100  → TENANT_KEY = 700
 ```
 
 **驗證：**
@@ -974,9 +985,9 @@ redis-cli KEYS "plugin-ai-rate-limiting*" | xargs redis-cli DEL
 **目的：** `openai-p1-a` TPM 耗盡時，請求自動轉到同 priority 的 `openai-p1-b`。
 
 ```bash
-# 把 openai-p1-a 的計數器設滿（模擬耗盡）
+# 把 openai-p1-a 的計數器設滿（模擬耗盡：remaining = -1 ≤ 0）
 KEY_A="plugin-ai-rate-limiting<conf_id>#openai-p1-a:openai-p1-a"
-redis-cli SET "$KEY_A" 5001 EX 60
+redis-cli SET "$KEY_A" -1 EX 60
 
 # 發送請求（ai-proxy-multi 選到 openai-p1-a → check_instance_status → false → 切換）
 curl -v -X POST http://apisix:9080/ai/chat \
@@ -987,12 +998,12 @@ curl -v -X POST http://apisix:9080/ai/chat \
 **預期：**
 - HTTP 200（非 429）
 - Response header 含 `X-AI-RateLimit-Limit-openai-p1-b`（表示打到了 B）
-- `openai-p1-a` 計數器不再增加（check_instance_status cost=0，無寫入）
+- `openai-p1-a` 計數器不再變動（check_instance_status 使用 direct GET，無寫入）
 
 **驗證：**
 ```bash
 KEY_B="plugin-ai-rate-limiting<conf_id>#openai-p1-b:openai-p1-b"
-redis-cli GET "$KEY_A"  # 仍為 5001（cost=0，check 無副作用）
+redis-cli GET "$KEY_A"  # 仍為 -1（direct GET 無副作用）
 redis-cli GET "$KEY_B"  # 有消耗，log phase 寫入
 ```
 
@@ -1003,11 +1014,11 @@ redis-cli GET "$KEY_B"  # 有消耗，log phase 寫入
 **目的：** priority=10 的 A 和 B 都耗盡時，自動降級到 priority=5 的 `deepseek-p2`。
 
 ```bash
-# 把 priority=10 的所有 instance 設滿
+# 把 priority=10 的所有 instance 設滿（remaining = -1 ≤ 0）
 KEY_A="plugin-ai-rate-limiting<conf_id>#openai-p1-a:openai-p1-a"
 KEY_B="plugin-ai-rate-limiting<conf_id>#openai-p1-b:openai-p1-b"
-redis-cli SET "$KEY_A" 5001 EX 60
-redis-cli SET "$KEY_B" 5001 EX 60
+redis-cli SET "$KEY_A" -1 EX 60
+redis-cli SET "$KEY_B" -1 EX 60
 
 curl -v -X POST http://apisix:9080/ai/chat \
   -H "Content-Type: application/json" \
@@ -1034,9 +1045,9 @@ redis-cli GET "$KEY_P2"  # 有消耗（log phase 寫入）
 KEY_A="plugin-ai-rate-limiting<conf_id>#openai-p1-a:openai-p1-a"
 KEY_B="plugin-ai-rate-limiting<conf_id>#openai-p1-b:openai-p1-b"
 KEY_P2="plugin-ai-rate-limiting<conf_id>#deepseek-p2:deepseek-p2"
-redis-cli SET "$KEY_A"  5001  EX 60
-redis-cli SET "$KEY_B"  5001  EX 60
-redis-cli SET "$KEY_P2" 10001 EX 60
+redis-cli SET "$KEY_A"  -1 EX 60
+redis-cli SET "$KEY_B"  -1 EX 60
+redis-cli SET "$KEY_P2" -1 EX 60
 
 curl -v -X POST http://apisix:9080/ai/chat \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}'
@@ -1085,7 +1096,7 @@ curl -v -X POST http://apisix:9080/ai/chat \
 
 ---
 
-#### TC-F05: check_instance_status cost=0 不增加計數器（副作用驗證）
+#### TC-F05: check_instance_status direct GET 不修改計數器（副作用驗證）
 
 **目的：** 確認 fallback 探測時不會對 Redis counter 造成副作用。
 
@@ -1102,8 +1113,8 @@ redis-cli GET "$KEY"
 ```
 
 **預期：**
-- 請求放行瞬間：`GET KEY` 回傳 `nil` 或 `0`（access phase 的 cost=0 無寫入）
-- log phase 執行後（約 100ms）：`GET KEY` 回傳實際 token 數（e.g. `847`）
+- 請求放行瞬間：`GET KEY` 回傳 `nil`（key 不存在；access phase 使用 direct GET，不寫入）
+- log phase 執行後（約 100ms）：`GET KEY` 回傳剩餘 token 數（e.g. `limit - 847`）
 - **不應出現** `1`（代表舊設計的 +1 placeholder 殘留）
 
 ---
@@ -1132,9 +1143,9 @@ redis-cli GET "$KEY"
 ```
 
 ```bash
-# 把 t-00000001 在 openai-p1-a 上的 tenant counter 設滿
+# 把 t-00000001 在 openai-p1-a 上的 tenant counter 設滿（remaining = -1 ≤ 0）
 TKEY_A="plugin-ai-rate-limiting<conf_id>#openai-p1-a#tenant#t-00000001:openai-p1-a#tenant#t-00000001"
-redis-cli SET "$TKEY_A" 1001 EX 60
+redis-cli SET "$TKEY_A" -1 EX 60
 
 # 發送請求（帶 tenant header）
 curl -v -X POST http://apisix:9080/ai/chat \
@@ -1147,13 +1158,13 @@ curl -v -X POST http://apisix:9080/ai/chat \
 - HTTP 200（非 429）
 - Response 含 `X-AI-RateLimit-Limit-Tenant: 1000` 且 `X-AI-RateLimit-Remaining-Tenant` 接近 1000
   （表示打到了 openai-p1-b，其 tenant counter 是獨立的，尚有餘量）
-- `openai-p1-a` 的 tenant counter 仍為 1001（check_instance_status cost=0，無副作用）
+- `openai-p1-a` 的 tenant counter 仍為 -1（check_instance_status 使用 direct GET，無副作用）
 
 **驗證：**
 ```bash
 TKEY_B="plugin-ai-rate-limiting<conf_id>#openai-p1-b#tenant#t-00000001:openai-p1-b#tenant#t-00000001"
-redis-cli GET "$TKEY_A"   # 仍為 1001（check 不寫入）
-redis-cli GET "$TKEY_B"   # log phase 寫入後應有 actual token 數（e.g. 847）
+redis-cli GET "$TKEY_A"   # 仍為 -1（direct GET 不寫入）
+redis-cli GET "$TKEY_B"   # log phase 寫入後應有剩餘量（e.g. 1000 - 847 = 153）
 ```
 
 **Fallback 觸發路徑：**
@@ -1162,11 +1173,11 @@ check_instance_status(conf, ctx, "openai-p1-a")
   → Step 1: 無 instance-level limit → 跳過
   → Step 2: tenant_tpm 有設定，t-tenant-id = "t-00000001"
             get_tenant_limit_conf(conf, "openai-p1-a", "t-00000001") → 找到
-            INCRBY key 0 → consumed = 1001 > 1000 → "rejected" → return false ✓
+            GET key → remaining = -1 ≤ 0 → return false ✓
 
 check_instance_status(conf, ctx, "openai-p1-b")
   → Step 2: get_tenant_limit_conf(conf, "openai-p1-b", "t-00000001") → 找到
-            INCRBY key 0 → consumed = 0 < 1000 → pass → return true ✓
+            GET key → nil（key 不存在，fresh window）→ pass → return true ✓
 ```
 
 ---
@@ -1199,7 +1210,7 @@ curl -v -X POST http://apisix:9080/ai/chat \
 |---|---|
 | LRU Cache 延遲 | `tenant_limit_conf_cache` TTL=300s，config 更新後配額設定最慢 5 分鐘後生效 |
 | 無 Tenant Header = 不限 Tenant | 若需要強制要求所有請求帶 tenant header，需在其他地方（如 `serverless-pre-function`）做驗證 |
-| Log Phase 非同步 | access phase 是純讀（cost=0），log phase 才寫入；高並發下同窗口內多個請求可能集體超限 |
+| Log Phase 非同步 | access phase 是純讀（direct GET），log phase 才寫入；高並發下同窗口內多個請求可能集體超限 |
 | Tenant ID 信任 | 插件直接信任 `t-tenant-id` header 的值，建議搭配 JWT / API Key 等認證機制確保 tenant ID 不被偽造 |
 | Redis 單點 | 若 Redis 故障，`allow_degradation: true`（預設）時 Fail-open 放行所有請求 |
 
@@ -1313,24 +1324,24 @@ Request 進入 pick_target()，帶有 t-tenant-id: t-00000001
         │   ├─ check_instance_status(nil, ctx, "openai-p1-a")
         │   │    conf == nil → 搜尋 ctx.plugins["ai-rate-limiting"] → 找到
         │   │    Step 1: instance limit_conf 存在？
-        │   │      → 有：INCRBY key 0 → consumed > limit → return false  (instance 滿)
+        │   │      → 有：GET key → remaining ≤ 0 → return false  (instance 滿)
         │   │      → 無：跳過
         │   │    Step 2: tenant_tpm 有設定？
         │   │      → 有：get_tenant_limit_conf("openai-p1-a", "t-00000001")
-        │   │            INCRBY key 0 → consumed > limit → return false  (tenant 滿)
+        │   │            GET key → remaining ≤ 0 → return false  (tenant 滿)
         │   │
         │   ├─ return false → server_picker.after_balance(ctx, true)  ← 標記失敗
         │   ├─ server_picker.get(ctx)  → 同 priority 下一個：openai-p1-b
         │   │
         │   ├─ check_instance_status(nil, ctx, "openai-p1-b")
         │   │    Step 2: get_tenant_limit_conf("openai-p1-b", "t-00000001")
-        │   │            → 獨立計數器，consumed = 0 < limit → pass
+        │   │            → 獨立計數器，GET key → nil（fresh window）→ pass
         │   │    return true → break
         │
         └─ return "openai-p1-b", its_conf
 
 ctx.picked_ai_instance_name = "openai-p1-b"
-→ _M.access() 再次確認（最終閘門，同樣 cost=0）
+→ _M.access() 再次確認（最終閘門，同樣 direct GET）
 → _M.log() 將 actual tokens 寫入 openai-p1-b 的計數器
 ```
 
