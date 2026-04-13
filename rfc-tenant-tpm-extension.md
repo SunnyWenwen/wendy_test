@@ -324,11 +324,118 @@ v1 → v2 的差異只有以下 4 個地方：
 
 ```
 limit_conf_cache       { ttl=300, count=512  }   ← 現有，keyed by conf table
-tenant_limit_conf_cache{ ttl=300, count=4096 }   ← 新增，keyed by "<conf_id>#<tenant_id>"
+tenant_limit_conf_cache{ ttl=300, count=4096 }   ← 新增，keyed by "<conf_id>#<instance_name>#<tenant_id>"
 ```
 
 tenant cache 使用字串 key `"<conf_id>#<instance_name>#<tenant_id>"` 是因為這三個維度都來自 runtime，無法以 conf table identity 作為 key。
 count=4096 可容納 4096 個不同的 (config, instance, tenant) 組合，應足以應對大多數生產場景。
+
+#### Cache 1：`limit_conf_cache` — 存 instance 維度的設定 map
+
+**Cache key**：plugin_conf 物件本身（Lua table identity）
+
+**Cache value**：`instance_name → limit_conf` 的 map，每筆 limit_conf 包含計數器所需的全部資訊：
+
+```
+路由設定：
+  instances:
+    - { name: "openai-primary",  limit: 5000,  time_window: 60 }
+    - { name: "deepseek-backup", limit: 2000,  time_window: 60 }
+
+limit_conf_cache 存入：
+  {
+    "openai-primary"  → { group="route-abc#openai-primary",
+                          count=5000, time_window=60,
+                          policy="redis", redis_host="...",
+                          limit_header="X-AI-RateLimit-Limit-openai-primary", ... }
+    "deepseek-backup" → { group="route-abc#deepseek-backup",
+                          count=2000, time_window=60, ... }
+  }
+```
+
+每次 request 進來時，直接用 `instance_name` 取出對應的 limit_conf，不需重建。
+
+---
+
+#### Cache 2：`tenant_limit_conf_cache` — 存 (instance, tenant) 維度的設定
+
+**Cache key**：`conf_id + "#" + instance_name + "#" + tenant_id` 字串
+
+**Cache value**：單一 limit_conf 物件
+
+##### 情境 A：全部走 default（無 override）
+
+```
+路由設定：
+  tenant_tpm:
+    default:
+      - { name: "openai-primary", limit: 1000, time_window: 60 }
+
+三個 tenant 各發一次 request 後，cache 內容：
+
+key: "route-abc#openai-primary#t-11111111"
+  → { group="route-abc#openai-primary#tenant#t-11111111",
+      count=1000, time_window=60, ... }      ← limit 來自 default
+
+key: "route-abc#openai-primary#t-22222222"
+  → { group="route-abc#openai-primary#tenant#t-22222222",
+      count=1000, time_window=60, ... }      ← limit 相同，但 group 不同
+
+key: "route-abc#openai-primary#t-33333333"
+  → { group="route-abc#openai-primary#tenant#t-33333333",
+      count=1000, time_window=60, ... }      ← 同上
+```
+
+三筆的 `count` / `time_window` 完全相同（都來自 default），但 `group` 各自不同。
+`group` 決定 Redis key，所以三個 tenant 的計數器在 Redis 中仍然**完全獨立**：
+
+```
+Redis key for t-11111111: "plugin-ai-rate-limitingroute-abc#openai-primary#tenant#t-11111111:..."
+Redis key for t-22222222: "plugin-ai-rate-limitingroute-abc#openai-primary#tenant#t-22222222:..."
+Redis key for t-33333333: "plugin-ai-rate-limitingroute-abc#openai-primary#tenant#t-33333333:..."
+```
+
+##### 情境 B：部分 tenant 有 override
+
+```
+路由設定：
+  tenant_tpm:
+    default:
+      - { name: "openai-primary", limit: 1000, time_window: 60 }
+    overrides:
+      t-vip-001:
+        - { name: "openai-primary", limit: 50000, time_window: 60 }
+
+三個 tenant 各發一次 request 後，cache 內容：
+
+key: "route-abc#openai-primary#t-vip-001"
+  → { group="route-abc#openai-primary#tenant#t-vip-001",
+      count=50000, time_window=60, ... }     ← 來自 overrides，limit 較高
+
+key: "route-abc#openai-primary#t-11111111"
+  → { group="route-abc#openai-primary#tenant#t-11111111",
+      count=1000, time_window=60, ... }      ← 來自 default
+
+key: "route-abc#openai-primary#t-22222222"
+  → { group="route-abc#openai-primary#tenant#t-22222222",
+      count=1000, time_window=60, ... }      ← 來自 default
+```
+
+---
+
+#### Cache 不存 token 數值，只存「設定」
+
+兩個 cache 存的都是 Lua table（設定物件），**不包含任何計數器數值**。
+計數器（目前剩餘多少 token）只存在 Redis key 裡。
+
+```
+LRU Cache          Redis
+──────────         ──────────────────────────────────────
+limit_conf         "plugin-ai-rate-limiting..." → 4153  (remaining tokens)
+  ↑                                                ↑
+  設定（limit=5000, 連線資訊…）             實際計數
+  TTL 300 秒自動更新                         TTL = time_window 到期重置
+```
 
 ### 4.3 Tenant 不存在時的行為
 
