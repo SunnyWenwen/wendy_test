@@ -150,7 +150,85 @@ Request with header:  t-tenant-id: t-12345678
 
 ## 3. Schema 變更
 
-### 3.1 新增欄位：`tenant_tpm`
+### 3.1 完整參數一覽
+
+下表列出本 plugin 所有參數，並標明哪些來自原生 `ai-rate-limiting`、哪些是本版本新增。
+
+#### 頂層參數
+
+| 參數 | 類型 | 必填條件 | 預設值 | 來源 | 說明 |
+|---|---|---|---|---|---|
+| `limit` | integer | anyOf（與 `time_window` 配對） | — | 原生 | 全域 TPM 上限（所有 instance 共用單一計數器） |
+| `time_window` | integer | anyOf（與 `limit` 配對） | — | 原生 | 限流時間窗口（秒） |
+| `instances` | array | anyOf | — | 原生 | 各 AI instance 個別 TPM 限制陣列（見下） |
+| `tenant_tpm` | object | anyOf | — | **新增** | Per-tenant TPM 配額設定（見下） |
+| `limit_strategy` | string | 否 | `total_tokens` | 原生 | 計算哪種 token 數：`total_tokens` / `prompt_tokens` / `completion_tokens` |
+| `show_limit_quota_header` | boolean | 否 | `true` | 原生 | 是否在 response 回傳 `X-AI-RateLimit-*` headers |
+| `rejected_code` | integer | 否 | `503` | 原生 | 超限時的 HTTP 狀態碼（200–599） |
+| `rejected_msg` | string | 否 | — | 原生 | 超限時回傳的錯誤訊息；未設定則只回傳狀態碼 |
+| `policy` | string | 否 | `local` | **新增** | 計數器後端：`local`（各 worker 記憶體）或 `redis` |
+| `allow_degradation` | boolean | 否 | `true` | **新增**（原生固定 `false`） | Redis 故障時是否 Fail-open（放行所有請求） |
+
+> **anyOf 規則**：`limit + time_window`、`instances`、`tenant_tpm` 三者至少需提供一個。  
+> 原生 plugin 僅支援前兩種；本版本新增第三種，使 `tenant_tpm` 可單獨使用（instance-level TPM 為選填）。
+
+---
+
+#### `instances[]` 子參數（來源：原生，無變動）
+
+| 參數 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `name` | string | ✓ | AI instance 名稱，需與 `ai-proxy-multi` 的 instance name 一致 |
+| `limit` | integer | ✓ | 此 instance 的 TPM 上限 |
+| `time_window` | integer | ✓ | 此 instance 的限流窗口（秒） |
+
+---
+
+#### `tenant_tpm` 子參數（來源：**新增**）
+
+| 參數 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `tenant_tpm.default` | array | ✓ | 未在 `overrides` 中的 tenant 套用此預設配額；每筆包含 `name` / `limit` / `time_window` |
+| `tenant_tpm.default[].name` | string | ✓ | AI instance 名稱（限定此限制適用的 instance） |
+| `tenant_tpm.default[].limit` | integer | ✓ | 每個 tenant 在此 instance 的 TPM 上限 |
+| `tenant_tpm.default[].time_window` | integer | ✓ | 限流窗口（秒） |
+| `tenant_tpm.overrides` | object | 否 | key = tenant ID（如 `t-00000001`），value = 與 `default` 相同結構的陣列 |
+
+**Tenant ID 來源**：HTTP request header `t-tenant-id`。無此 header 時跳過所有 tenant 檢查。
+
+---
+
+#### Redis 相關參數（`policy: "redis"` 時啟用，來源：**新增**）
+
+| 參數 | 類型 | 必填 | 預設值 | 說明 |
+|---|---|---|---|---|
+| `redis_host` | string | ✓ | — | Redis 主機位址 |
+| `redis_port` | integer | 否 | `6379` | Redis 連接埠 |
+| `redis_username` | string | 否 | — | Redis 使用者名稱（ACL 驗證） |
+| `redis_password` | string | 否 | — | Redis 密碼 |
+| `redis_database` | integer | 否 | `0` | Redis 資料庫索引 |
+| `redis_timeout` | integer | 否 | `1000` | 連線逾時（毫秒） |
+| `redis_ssl` | boolean | 否 | `false` | 啟用 TLS 加密連線 |
+| `redis_ssl_verify` | boolean | 否 | `false` | 驗證 TLS 憑證（需搭配 `redis_ssl: true`） |
+| `redis_keepalive_timeout` | integer | 否 | `10000` | keepalive 逾時（毫秒，最小 1000） |
+| `redis_keepalive_pool` | integer | 否 | `100` | keepalive 連線池大小（最小 1） |
+
+---
+
+#### Response Headers（policy 無關，由 `show_limit_quota_header` 控制）
+
+| Header | 說明 |
+|---|---|
+| `X-AI-RateLimit-Limit-<instance>` | Instance 層 TPM 上限 |
+| `X-AI-RateLimit-Remaining-<instance>` | Instance 層目前剩餘 tokens |
+| `X-AI-RateLimit-Reset-<instance>` | Instance 層窗口重置剩餘秒數 |
+| `X-AI-RateLimit-Limit-Tenant` | Tenant 層 TPM 上限 |
+| `X-AI-RateLimit-Remaining-Tenant` | Tenant 層目前剩餘 tokens |
+| `X-AI-RateLimit-Reset-Tenant` | Tenant 層窗口重置剩餘秒數 |
+
+---
+
+### 3.2 新增欄位：`tenant_tpm`
 
 `default` 與 `overrides` 的值都是 **陣列**，每個元素包含 `name`（對應 AI instance 名稱）、`limit`、`time_window`，讓不同 instance 可以設定不同的 tenant TPM 配額。
 
@@ -177,7 +255,7 @@ Request with header:  t-tenant-id: t-12345678
 }
 ```
 
-### 3.2 配額查找優先序
+### 3.3 配額查找優先序
 
 對每個 **(instance_name, tenant_id)** 組合，lookup 順序：
 
@@ -191,7 +269,7 @@ instance_name = "openai-primary", tenant_id = "t-12345678"
 4. 無 t-tenant-id header                                      → 跳過 tenant 檢查
 ```
 
-### 3.3 完整 Schema 範例
+### 3.4 完整 Schema 範例
 
 ```json
 {
@@ -575,7 +653,7 @@ redis-cli KEYS "plugin-ai-rate-limiting*" | xargs redis-cli DEL
         }
       ]
     },
-    "ai-rate-limiting-redis": {
+    "ai-rate-limiting": {
       "instances": [
         { "name": "openai-primary", "limit": 100000, "time_window": 60 }
       ],
