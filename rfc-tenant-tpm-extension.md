@@ -1401,37 +1401,7 @@ curl -v -X POST http://apisix:9080/ai/chat \
 
 ---
 
-## 10. 與 RFC-001 的 diff 摘要
-
-```lua
--- v1 → v2 新增 / 修改：
--- 新增：tenant_limit_entry_schema  (含 name, limit, time_window)
--- 新增：tenant_limit_list_schema   (陣列型別)
--- 新增：tenant_tpm_schema
--- 修改：schema.properties 加入 tenant_tpm 欄位
-
--- 新增：get_plugin_conf_id()              (取得穩定的 plugin conf 識別 ID)
--- 新增：copy_redis_conf()                 (從 transform_limit_conf 抽取，消除重複)
--- 新增：find_instance_limit_in_list()     (在陣列中依 name 查找 entry)
--- 新增：build_tenant_limit_conf()
--- 新增：get_tenant_limit_conf()
--- 新增：tenant_limit_conf_cache (LRU, count=4096)
-
--- 修改：transform_limit_conf() — 加入 conf.group 修正 Redis key 建構
---       (limit-count gen_limit_key 需要 conf.group 或 conf._meta.parent.resource_key，
---        自建 limit_conf 無 _meta.parent，必須用 conf.group bypass)
--- 修改：build_tenant_limit_conf() — 陣列 lookup；找不到 instance entry 時回傳 nil
--- 修改：_M.access() — Step 2 tenant check（nil conf 時跳過）
--- 修改：_M.log()    — timer 內增加 tenant counter 更新（nil conf 時跳過）
-
--- 不變：_M.check_instance_status()
--- 不變：fetch_limit_conf_kvs()
--- 不變：get_token_usage()
-```
-
----
-
-## 11. 配置建議
+## 10. 配置建議
 
 ### 大多數 Tenant 用 default，少數 Tenant 有 override（推薦）
 
@@ -1469,7 +1439,7 @@ local tenant_limit_conf_cache = core.lrucache.new({ ttl = 300, count = 16384 })
 
 ---
 
-## 12. `fallback_strategy: ["rate_limiting"]` 與 `ai-proxy-multi` 整合
+## 11. `fallback_strategy: ["rate_limiting"]` 與 `ai-proxy-multi` 整合
 
 ### 12.1 問題現象（歷史背景）
 
@@ -1534,7 +1504,7 @@ Priority 降級由 APISIX 內建的 `priority_balancer` 自動處理：同 prior
 
 ---
 
-## 13. 參考資料
+## 12. 參考資料
 
 - [RFC-001: ai-rate-limiting-redis](./rfc-ai-rate-limiting-redis.md)
 - [APISIX limit-count plugin source](https://github.com/apache/apisix/blob/master/apisix/plugins/limit-count/init.lua)
