@@ -169,7 +169,7 @@ local schema = {
 
 local _M = {
     version  = 0.1,
-    priority = 1029,
+    priority = 998,
     name     = plugin_name,
     schema   = schema,
 }
@@ -563,6 +563,7 @@ function _M.check_instance_status(conf, ctx, instance_name)
             core.log.info(
                 "check_instance_status: instance TPM exhausted for ", instance_name
             )
+            ctx.ai_rl_tpm_exhausted = true
             return false
         end
     end
@@ -582,6 +583,7 @@ function _M.check_instance_status(conf, ctx, instance_name)
                         "check_instance_status: tenant TPM exhausted",
                         " instance: ", instance_name, " tenant: ", tenant_id
                     )
+                    ctx.ai_rl_tpm_exhausted = true
                     return false
                 end
             end
@@ -690,6 +692,27 @@ function _M.log(conf, ctx)
 
     if not ok then
         core.log.error("failed to create timer for token usage update: ", err)
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- header_filter / body_filter  — intercept ai-proxy-multi "all servers tried"
+-- ---------------------------------------------------------------------------
+-- When all instances are TPM-exhausted, ai-proxy-multi exits with 503 and the
+-- message "all servers tried".  We catch that here and replace it with 429 so
+-- the caller gets a meaningful rate-limit signal instead of a generic error.
+
+function _M.header_filter(conf, ctx)
+    if ctx.ai_rl_tpm_exhausted and ngx.status == 503 then
+        ngx.status = 429
+        ctx.ai_rl_status_overridden = true
+    end
+end
+
+function _M.body_filter(conf, ctx)
+    if ctx.ai_rl_status_overridden then
+        ngx.arg[1] = "The token per minute (TPM) quota has been reached."
+        ngx.arg[2] = true
     end
 end
 
