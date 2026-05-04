@@ -325,7 +325,10 @@ local function transform_limit_conf(plugin_conf, instance_conf, instance_name)
     local group = get_plugin_conf_id(plugin_conf) .. "#" .. key
 
     local conf = {
-        _vid      = key,
+        -- _vid is the version key for limit-count's internal limiter cache.
+        -- Including limit+time_window ensures a new limiter is created whenever
+        -- TPM settings change via admin API, without requiring a pod restart.
+        _vid      = key .. ":" .. tostring(limit) .. ":" .. tostring(time_window),
         conf_id   = plugin_conf._meta and plugin_conf._meta.id or key,
         group     = group,
         key       = key,
@@ -385,7 +388,7 @@ local function build_tenant_limit_conf(plugin_conf, instance_name, tenant_id)
     local group = get_plugin_conf_id(plugin_conf) .. "#" .. key
 
     local conf = {
-        _vid      = key,
+        _vid      = key .. ":" .. tostring(limit_cfg.limit) .. ":" .. tostring(limit_cfg.time_window),
         conf_id   = get_plugin_conf_id(plugin_conf) .. "#" .. key,
         group     = group,
         key       = key,
@@ -414,8 +417,11 @@ end
 -- Retrieve (or build + cache) the tenant limit_conf for a given
 -- (instance_name, tenant_id) pair.
 local function get_tenant_limit_conf(plugin_conf, instance_name, tenant_id)
-    local conf_id   = get_plugin_conf_id(plugin_conf)
-    local cache_key = conf_id .. "#" .. instance_name .. "#" .. tenant_id
+    -- tostring(plugin_conf) yields the table address, which changes whenever
+    -- APISIX rebuilds the conf object after an admin API update.  This ensures
+    -- the tenant limit_conf is rebuilt immediately on TPM changes instead of
+    -- serving the old count for up to 300 s (the cache TTL).
+    local cache_key = tostring(plugin_conf) .. "#" .. instance_name .. "#" .. tenant_id
     return tenant_limit_conf_cache(
         cache_key, nil,
         build_tenant_limit_conf, plugin_conf, instance_name, tenant_id

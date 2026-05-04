@@ -163,7 +163,7 @@ end
 print("\n--- T2: Fallback (A exhausted, B available) ---")
 reset()
 do
-    exhausted_set["openai-a"] = true   -- only A is over limit
+    exhausted_set["openai-a:1000:60"] = true   -- _vid now includes limit:time_window
     local conf = make_conf({
         { name = "openai-a", limit = 1000, time_window = 60 },
         { name = "openai-b", limit = 1000, time_window = 60 },
@@ -195,8 +195,8 @@ end
 print("\n--- T3: All instances exhausted → 503 becomes 429 ---")
 reset()
 do
-    exhausted_set["openai-a"] = true
-    exhausted_set["openai-b"] = true
+    exhausted_set["openai-a:1000:60"] = true
+    exhausted_set["openai-b:1000:60"] = true
     local conf = make_conf({
         { name = "openai-a", limit = 1000, time_window = 60 },
         { name = "openai-b", limit = 1000, time_window = 60 },
@@ -279,8 +279,8 @@ print("\n--- T7: Tenant TPM — exhausted on A, available on B → fallback work
 reset()
 do
     -- Tenant counter key format: "<instance>#tenant#<tenant_id>"
-    exhausted_set["openai-a#tenant#t-001"] = true   -- tenant quota on A is full
-    -- openai-b#tenant#t-001 is NOT exhausted (independent counter)
+    exhausted_set["openai-a#tenant#t-001:500:60"] = true   -- _vid now includes limit:time_window
+    -- openai-b#tenant#t-001:500:60 is NOT exhausted (independent counter)
 
     local tenant_tpm = {
         default = {
@@ -318,6 +318,36 @@ do
 
     local ok = plugin.check_instance_status(nil, ctx, "openai-a")
     check("nil conf: resolves from ctx.plugins, returns true", ok, true)
+end
+
+-- ============================================================
+-- T9  _vid encodes limit: changing TPM creates a different _vid
+--     so limit-count's internal limiter cache is invalidated immediately.
+-- ============================================================
+print("\n--- T9: _vid includes limit — TPM change produces different _vid ---")
+reset()
+do
+    -- Simulate conf v1 (old limit = 1000)
+    local conf_v1 = make_conf({ { name = "openai-a", limit = 1000, time_window = 60 } })
+    local ctx     = make_ctx()
+    local kvs_v1  = plugin.check_instance_status(conf_v1, ctx, "openai-a")  -- warm cache
+
+    -- Extract _vid from the built limit_conf (reach into the lrucache via access)
+    -- We verify indirectly: exhausted_set keyed by new _vid format works
+    exhausted_set["openai-a:1000:60"] = true
+    local ok_v1 = plugin.check_instance_status(conf_v1, ctx, "openai-a")
+    check("T9: v1 (limit=1000) enforces old limit → false", ok_v1, false)
+
+    -- Simulate admin updates limit to 2000 → APISIX creates new conf table
+    reset()
+    local ctx_v2  = make_ctx()   -- fresh ctx, no leftover flags from v1
+    local conf_v2 = make_conf({ { name = "openai-a", limit = 2000, time_window = 60 } })
+    -- exhausted_set only has the OLD _vid key; new _vid is "openai-a:2000:60" → no match
+    exhausted_set["openai-a:1000:60"] = true   -- old entry, should NOT match
+
+    local ok_v2 = plugin.check_instance_status(conf_v2, ctx_v2, "openai-a")
+    check("T9: v2 (limit=2000) uses new _vid → not exhausted → true", ok_v2, true)
+    check("T9: flag NOT set (different _vid, different limiter)", ctx_v2.ai_rl_tpm_exhausted, nil)
 end
 
 -- ============================================================
