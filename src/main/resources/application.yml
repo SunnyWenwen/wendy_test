@@ -26,4 +26,50 @@ app:
       max-attempts: 3
       initial-interval: 1000
       multiplier: 2.0
-      max-interval: 10000 
+      max-interval: 10000
+
+# ── CCR (Claude Code Router) ─────────────────────────────────────────────────
+# Transforms Anthropic Messages API → OpenAI /chat/completions format and
+# proxies to the downstream APISIX → LiteLLM gateway.
+#
+# Flow:
+#   Claude Code (Anthropic format)
+#     → CCR /v1/messages          [this service, port 8080]
+#       → APISIX /v1/chat/completions
+#         → LiteLLM
+#           → Bedrock Claude (Converse) | Vertex Gemini | GPT-5
+#
+# Claude Code env vars:
+#   ANTHROPIC_BASE_URL=http://<ccr-host>:8080
+#   ANTHROPIC_API_KEY=<any-string>   (CCR ignores it; APISIX key is below)
+ccr:
+  # OpenAI-compatible endpoint exposed by APISIX in front of LiteLLM
+  downstream-url: http://apisix:9080/v1/chat/completions
+
+  # API key forwarded as "Authorization: Bearer <key>" to APISIX / LiteLLM
+  api-key: ${CCR_API_KEY:}
+
+  # Timeouts
+  connect-timeout-ms: 10000
+  read-timeout-ms: 120000
+  stream-read-timeout-ms: 0    # no timeout for SSE streams
+
+  # Optional: remap Anthropic model IDs to the names LiteLLM expects.
+  # Leave empty to pass through model names unchanged.
+  #
+  # LiteLLM model-name format:
+  #   Bedrock  → bedrock/<aws-model-id>
+  #   Vertex   → vertex_ai/<google-model-id>
+  #   OpenAI   → openai/<model-id>  (or just <model-id> if default provider)
+  model-mapping:
+    # Bedrock Claude (Converse API via LiteLLM)
+    claude-opus-4-7:            bedrock/anthropic.claude-opus-4-7-20250514-v1:0
+    claude-sonnet-4-6:          bedrock/anthropic.claude-sonnet-4-6-20250514-v1:0
+    claude-haiku-4-5-20251001:  bedrock/anthropic.claude-haiku-4-5-20251001-v1:0
+
+    # Vertex AI Gemini
+    gemini-2.0-flash:           vertex_ai/gemini-2.0-flash
+    gemini-1.5-pro:             vertex_ai/gemini-1.5-pro-002
+
+    # OpenAI GPT-5 (when available)
+    gpt-5:                      openai/gpt-5
