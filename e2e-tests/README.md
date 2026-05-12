@@ -1,139 +1,136 @@
-# LLM Gateway E2E Test Suite
+# LLM Gateway E2E 測試套件
 
-End-to-end integration tests for the self-hosted LLM Gateway stack:
+自架 LLM Gateway 整合測試，驗證 Claude Code 與 Kilo Code 透過 Gateway 串接 AWS Bedrock / Vertex AI 的完整鏈路。
 
 ```
-Claude Code / Kilo → API6 (ai-proxy-multi) → LiteLLM → AWS Bedrock / Vertex AI
+Claude Code / Kilo Code
+    → API6 (ai-proxy-multi)
+    → LiteLLM
+    → AWS Bedrock (Claude Sonnet/Opus) / Vertex AI (Gemini)
 ```
 
-## Quick Start
+詳細測試規劃請參閱 [TEST_DESIGN.md](./TEST_DESIGN.md)。
+
+---
+
+## 快速開始
 
 ```bash
 cd e2e-tests
 python3 -m pip install -e ".[dev]"
-cp .env.example .env        # fill in GATEWAY_BASE_URL, GATEWAY_API_KEY, etc.
-make smoke                  # connectivity checks first
-make test                   # full suite (skips slow)
+cp .env.example .env   # 填入 GATEWAY_BASE_URL、GATEWAY_API_KEY
+make smoke             # 先跑連線驗證
+make test              # 完整測試（略過 slow 標記）
 ```
 
-## Architecture
+---
+
+## 目錄結構
 
 ```
 e2e-tests/
 ├── agents/
-│   ├── base.py             # shared async HTTP client
-│   ├── claude_code.py      # CCR format simulator (reasoning dict, system prompt, etc.)
-│   └── kilo.py             # Kilo OpenAI-compatible simulator + fixture loader
+│   ├── base.py              # 共用 async HTTP client
+│   ├── claude_code.py       # CCR 格式模擬器（reasoning dict、thinking、cache_control）
+│   └── kilo.py              # Kilo OpenAI-compatible 模擬器 + fixture loader
 ├── config/
-│   ├── models.yaml         # model registry (add new models here)
-│   └── settings.py         # env-based config
+│   ├── models.yaml          # 模型 registry（新增模型只需改此檔）
+│   └── settings.py          # 環境變數設定，含 default model 常數
 ├── fixtures/
-│   ├── kilo_payloads/      # real captured Kilo request bodies (.json)
-│   └── cc_payloads/        # real captured CCR request bodies (.json)
+│   ├── kilo_payloads/       # Kilo 真實抓包 payload（.json）
+│   └── cc_payloads/         # CCR 真實抓包 payload（.json）
 ├── validators/
-│   ├── response.py         # OpenAI response schema assertions
-│   └── log_parser.py       # kubectl log capture + assertions
+│   ├── response.py          # OpenAI response schema assertions
+│   └── log_parser.py        # kubectl log 擷取與 assertion
 ├── utils/
-│   └── kubectl.py          # Kubernetes Python client wrapper
+│   └── kubectl.py           # Kubernetes Python client 包裝
 └── tests/
-    ├── conftest.py          # shared fixtures, auto-parametrization
-    ├── test_connectivity.py # gateway reachability
-    ├── test_claude_code.py  # CCR-specific behaviour
-    ├── test_kilo.py         # Kilo OpenAI-compatible behaviour
-    ├── test_models.py       # all models × basic / streaming / tool_use
-    ├── test_streaming.py    # SSE streaming
-    ├── test_tool_use.py     # function calling round-trip
-    └── test_reasoning.py    # extended thinking / reasoning_effort
+    ├── conftest.py           # 共用 fixtures、自動 parametrize
+    ├── test_connectivity.py  # 連線與認證 smoke tests
+    ├── test_claude_code.py   # CCR 特有行為測試
+    ├── test_kilo.py          # Kilo 行為測試
+    ├── test_models.py        # 全模型矩陣（自動 parametrize）
+    ├── test_streaming.py     # SSE streaming 測試
+    ├── test_tool_use.py      # 工具調用 round-trip 測試
+    └── test_reasoning.py     # Extended thinking / reasoning 測試
 ```
 
-## Adding a New Model
+---
 
-1. Open `config/models.yaml` and add an entry under the correct upstream:
+## 測試模型
+
+| 模型 ID（Gateway alias） | Upstream | 能力 |
+|---|---|---|
+| `claude-sonnet-4.5` | AWS Bedrock | streaming, tool_use, reasoning, vision |
+| `claude-sonnet-4.6` | AWS Bedrock | streaming, tool_use, reasoning, vision |
+| `claude-opus-4.6` | AWS Bedrock | streaming, tool_use, reasoning, vision |
+| `claude-opus-4.7` | AWS Bedrock | streaming, tool_use, reasoning, vision |
+| `gemini-3-pro-preview` | Vertex AI | streaming, tool_use, reasoning, vision |
+| `gemini-3.1-flash-lite-preview` | Vertex AI | streaming, tool_use, vision |
+
+---
+
+## 執行指令
+
+```bash
+make smoke        # 連線 smoke test（最快，先跑這個）
+make cc           # Claude Code / CCR 測試
+make kilo         # Kilo 測試
+make models       # 所有模型矩陣
+make bedrock      # 只跑 Bedrock 模型
+make vertex       # 只跑 Vertex 模型
+make streaming    # Streaming 測試
+make tools        # 工具調用測試
+make reasoning    # Reasoning 測試
+make no-logs      # 停用 kubectl log 驗證（無 k8s 存取時）
+```
+
+---
+
+## 新增模型
+
+只需在 `config/models.yaml` 增加一筆 entry，不需修改任何測試程式碼：
 
 ```yaml
 bedrock:
   claude-new-model:
-    model_id: "anthropic.claude-new-model-id"
+    model_id: "claude-new-model-alias"   # Gateway 對外的 alias
     upstream: bedrock
     capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
 ```
 
-2. Run the model matrix tests:
+執行 `make models` 即自動納入全模型矩陣測試。
 
-```bash
-make models
-```
+---
 
-The new model is automatically picked up by parametrised tests — no test code changes needed.
+## 環境變數
 
-## Providing Real Agent Payloads
-
-Replace `.json.example` files in `fixtures/` with real captured payloads:
-
-- **Kilo**: Capture outgoing HTTP requests from Kilo using mitmproxy or browser devtools when Kilo uses the OpenAI Compatible provider.
-- **CCR**: Capture requests from the CCR pod to LiteLLM via `kubectl logs`.
-
-```bash
-# Capture CCR → LiteLLM traffic
-kubectl logs -n llm-gateway -l app=litellm --since=1m | grep "request_body"
-```
-
-## Key Design Decisions
-
-### CCR Unified Format
-Claude Code sends `"reasoning": {"effort": "medium"}` (CCR format) instead of
-the OpenAI `"reasoning_effort": "medium"`. LiteLLM translates this before
-forwarding to Bedrock. Tests in `test_reasoning.py` and `test_claude_code.py`
-verify both that:
-1. The gateway accepts the CCR format (no 4xx).
-2. LiteLLM logs show `reasoning_effort` was sent to the upstream (log validation).
-
-When new CCR-specific fields are discovered, add them to `agents/claude_code.py`:
-```python
-_CCR_EXTRA_FIELDS: dict[str, Any] = {
-    "new_ccr_field": "value",
-}
-```
-
-### Log Validation
-After each request, the test suite optionally fetches recent pod logs via the
-Kubernetes Python client and asserts on:
-- Model routing (correct model_id appeared in LiteLLM logs)
-- Upstream reached (bedrock/vertex string in logs)
-- No ERROR/Exception log lines
-
-Disable log validation for faster local runs:
-```bash
-ENABLE_LOG_VALIDATION=false make test
-# or
-make no-logs
-```
-
-## Environment Variables
-
-| Variable | Default | Description |
+| 變數 | 預設值 | 說明 |
 |---|---|---|
-| `GATEWAY_BASE_URL` | `http://localhost:4000` | LLM Gateway base URL |
-| `GATEWAY_API_KEY` | `` | API key for the gateway |
+| `GATEWAY_BASE_URL` | `http://testhost` | LLM Gateway 入口 |
+| `GATEWAY_API_KEY` | `XXXX` | Bearer Token |
+| `DEFAULT_BEDROCK_MODEL` | `claude-sonnet-4.5` | 一般測試預設模型 |
+| `DEFAULT_VERTEX_MODEL` | `gemini-3.1-flash-lite-preview` | Vertex 測試預設模型 |
+| `DEFAULT_REASONING_MODEL` | `claude-sonnet-4.6` | Reasoning 測試預設模型 |
 | `K8S_NAMESPACE` | `llm-gateway` | Kubernetes namespace |
-| `LITELLM_POD_LABEL` | `app=litellm` | Pod label selector for LiteLLM |
-| `AI_PROXY_POD_LABEL` | `app=ai-proxy-multi` | Pod label selector for ai-proxy |
-| `KUBECONFIG` | (default) | Path to kubeconfig |
-| `ENABLE_LOG_VALIDATION` | `true` | Toggle kubectl log assertions |
-| `LOG_TAIL_LINES` | `200` | Lines to tail from pods |
-| `LOG_CAPTURE_DELAY` | `2.0` | Seconds to wait before fetching logs |
-| `REQUEST_TIMEOUT` | `120.0` | HTTP request timeout (seconds) |
+| `LITELLM_POD_LABEL` | `app=litellm` | LiteLLM pod label selector |
+| `AI_PROXY_POD_LABEL` | `app=ai-proxy-multi` | ai-proxy pod label selector |
+| `ENABLE_LOG_VALIDATION` | `true` | 開啟 kubectl log assertions |
+| `LOG_TAIL_LINES` | `200` | 擷取的 log 行數 |
+| `LOG_CAPTURE_DELAY` | `2.0` | 請求後等待幾秒再取 log |
+| `REQUEST_TIMEOUT` | `120.0` | HTTP timeout（秒） |
 
-## CI Integration
+---
+
+## CI 整合範例
 
 ```yaml
-# Example GitHub Actions step
-- name: Run LLM Gateway E2E tests
+- name: LLM Gateway E2E Tests
   working-directory: e2e-tests
   env:
     GATEWAY_BASE_URL: ${{ secrets.LLM_GATEWAY_DEV_URL }}
     GATEWAY_API_KEY: ${{ secrets.LLM_GATEWAY_API_KEY }}
-    ENABLE_LOG_VALIDATION: "false"   # no k8s access in CI
+    ENABLE_LOG_VALIDATION: "false"
   run: |
     pip install -e ".[dev]"
     make smoke
