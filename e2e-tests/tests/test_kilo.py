@@ -15,13 +15,14 @@ from pathlib import Path
 import pytest
 
 from agents.kilo import KiloClient
+from config import settings
 from utils.kubectl import KubectlClient
 from validators.log_parser import LogValidator
 from validators.response import ResponseValidator
 
 pytestmark = pytest.mark.kilo
 
-_DEFAULT_MODEL = "anthropic.claude-sonnet-4-5"
+_DEFAULT_MODEL = settings.DEFAULT_BEDROCK_MODEL
 _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "kilo_payloads"
 
 

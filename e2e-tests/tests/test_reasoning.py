@@ -17,11 +17,15 @@ import pytest
 
 from agents.claude_code import ClaudeCodeClient
 from agents.kilo import KiloClient
+from config import settings
 from utils.kubectl import KubectlClient
 from validators.log_parser import LogValidator
 from validators.response import ResponseValidator
 
 pytestmark = pytest.mark.reasoning
+
+_DEFAULT_MODEL = settings.DEFAULT_BEDROCK_MODEL
+_REASONING_MODEL = settings.DEFAULT_REASONING_MODEL
 
 _REASONING_QUESTION = (
     "A snail is at the bottom of a 10-metre well. Each day it climbs 3 metres "
@@ -34,7 +38,7 @@ _REASONING_QUESTION = (
 @pytest.mark.asyncio
 async def test_cc_reasoning_low(cc_client: ClaudeCodeClient, rv: ResponseValidator) -> None:
     payload = cc_client.reasoning_payload(
-        model="anthropic.claude-sonnet-4-5",
+        model=_DEFAULT_MODEL,
         user_message=_REASONING_QUESTION,
         effort="low",
         max_tokens=512,
@@ -50,7 +54,7 @@ async def test_cc_reasoning_low(cc_client: ClaudeCodeClient, rv: ResponseValidat
 @pytest.mark.asyncio
 async def test_cc_reasoning_medium(cc_client: ClaudeCodeClient, rv: ResponseValidator) -> None:
     payload = cc_client.reasoning_payload(
-        model="anthropic.claude-sonnet-4-5",
+        model=_DEFAULT_MODEL,
         user_message=_REASONING_QUESTION,
         effort="medium",
         max_tokens=1024,
@@ -63,7 +67,7 @@ async def test_cc_reasoning_medium(cc_client: ClaudeCodeClient, rv: ResponseVali
 @pytest.mark.asyncio
 async def test_cc_reasoning_high(cc_client: ClaudeCodeClient, rv: ResponseValidator) -> None:
     payload = cc_client.reasoning_payload(
-        model="anthropic.claude-sonnet-4-6",
+        model=_REASONING_MODEL,
         user_message=_REASONING_QUESTION,
         effort="high",
         max_tokens=2048,
@@ -79,7 +83,7 @@ async def test_cc_reasoning_high(cc_client: ClaudeCodeClient, rv: ResponseValida
 async def test_kilo_reasoning_effort(kilo_client: KiloClient, rv: ResponseValidator) -> None:
     """Kilo sends reasoning_effort directly; must pass through unchanged."""
     payload = kilo_client.reasoning_payload(
-        model="anthropic.claude-sonnet-4-5",
+        model=_DEFAULT_MODEL,
         user_message=_REASONING_QUESTION,
         reasoning_effort="medium",
         max_tokens=1024,
@@ -126,7 +130,7 @@ async def test_ccr_reasoning_translated_in_logs(
         pytest.skip("Log validation disabled")
 
     payload = cc_client.reasoning_payload(
-        model="anthropic.claude-sonnet-4-5",
+        model=_DEFAULT_MODEL,
         user_message="What is 5 factorial?",
         effort="low",
         max_tokens=128,

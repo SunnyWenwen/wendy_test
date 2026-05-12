@@ -13,12 +13,13 @@ import pytest
 
 from agents.claude_code import ClaudeCodeClient
 from agents.kilo import KiloClient
+from config import settings
 from validators.response import ResponseValidator
 
 pytestmark = pytest.mark.streaming
 
-_MODEL_BEDROCK = "anthropic.claude-sonnet-4-5"
-_MODEL_VERTEX = "google/gemini-2.5-flash"
+_MODEL_BEDROCK = settings.DEFAULT_BEDROCK_MODEL
+_MODEL_VERTEX = settings.DEFAULT_VERTEX_MODEL
 
 
 @pytest.mark.asyncio

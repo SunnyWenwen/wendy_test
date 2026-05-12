@@ -16,9 +16,16 @@ def _require(key: str) -> str:
 
 
 # ── LLM Gateway ──────────────────────────────────────────────────────────────
-GATEWAY_BASE_URL: str = os.getenv("GATEWAY_BASE_URL", "http://localhost:4000")
-GATEWAY_API_KEY: str = os.getenv("GATEWAY_API_KEY", "")
+GATEWAY_BASE_URL: str = os.getenv("GATEWAY_BASE_URL", "http://testhost")
+GATEWAY_API_KEY: str = os.getenv("GATEWAY_API_KEY", "XXXX")
 CHAT_COMPLETIONS_PATH: str = "/chat/completions"
+
+# ── Default models used in single-model tests ────────────────────────────────
+# These should match model_id values in config/models.yaml.
+# Override via environment variables when running against a different deployment.
+DEFAULT_BEDROCK_MODEL: str = os.getenv("DEFAULT_BEDROCK_MODEL", "claude-sonnet-4.5")
+DEFAULT_VERTEX_MODEL: str = os.getenv("DEFAULT_VERTEX_MODEL", "gemini-3.1-flash-lite-preview")
+DEFAULT_REASONING_MODEL: str = os.getenv("DEFAULT_REASONING_MODEL", "claude-sonnet-4.6")
 
 # ── Kubernetes (for log validation) ──────────────────────────────────────────
 K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "llm-gateway")

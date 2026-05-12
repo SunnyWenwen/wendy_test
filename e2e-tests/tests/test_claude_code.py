@@ -12,14 +12,15 @@ from __future__ import annotations
 import pytest
 
 from agents.claude_code import ClaudeCodeClient
+from config import settings
 from utils.kubectl import KubectlClient
 from validators.log_parser import LogValidator
 from validators.response import ResponseValidator
 
 pytestmark = pytest.mark.claude_code
 
-# Representative model for CCR-specific tests (Bedrock Claude)
-_DEFAULT_MODEL = "anthropic.claude-sonnet-4-5"
+_DEFAULT_MODEL = settings.DEFAULT_BEDROCK_MODEL
+_REASONING_MODEL = settings.DEFAULT_REASONING_MODEL
 
 
 @pytest.mark.asyncio
@@ -153,7 +154,7 @@ async def test_ccr_reasoning_all_effort_levels(
     """All three CCR reasoning effort levels must be accepted by the gateway."""
     for effort in ("low", "medium", "high"):
         payload = cc_client.reasoning_payload(
-            model=_DEFAULT_MODEL,
+            model=_REASONING_MODEL,
             user_message="What is 3 × 4?",
             effort=effort,
             max_tokens=128,

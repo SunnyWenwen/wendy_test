@@ -15,11 +15,12 @@ import pytest
 
 from agents.claude_code import ClaudeCodeClient
 from agents.kilo import KiloClient
+from config import settings
 from validators.response import ResponseValidator
 
 pytestmark = pytest.mark.tool_use
 
-_MODEL = "anthropic.claude-sonnet-4-5"
+_MODEL = settings.DEFAULT_BEDROCK_MODEL
 
 
 @pytest.mark.asyncio

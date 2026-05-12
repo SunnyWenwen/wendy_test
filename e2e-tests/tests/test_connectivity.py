@@ -14,8 +14,8 @@ from validators.response import ResponseValidator
 pytestmark = pytest.mark.connectivity
 
 # Use the lightest available model for connectivity checks
-_SMOKE_MODEL_BEDROCK = "anthropic.claude-sonnet-4-5"
-_SMOKE_MODEL_VERTEX = "google/gemini-2.5-flash"
+_SMOKE_MODEL_BEDROCK = settings.DEFAULT_BEDROCK_MODEL
+_SMOKE_MODEL_VERTEX = settings.DEFAULT_VERTEX_MODEL
 
 
 @pytest.mark.asyncio
