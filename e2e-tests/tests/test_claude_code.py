@@ -143,3 +143,73 @@ async def test_log_model_routed_correctly(
     logs = await log_validator.after_request()
     log_validator.assert_model_routed(logs, _DEFAULT_MODEL)
     log_validator.assert_no_errors(logs)
+
+
+@pytest.mark.asyncio
+async def test_ccr_reasoning_all_effort_levels(
+    cc_client: ClaudeCodeClient,
+    rv: ResponseValidator,
+) -> None:
+    """All three CCR reasoning effort levels must be accepted by the gateway."""
+    for effort in ("low", "medium", "high"):
+        payload = cc_client.reasoning_payload(
+            model=_DEFAULT_MODEL,
+            user_message="What is 3 × 4?",
+            effort=effort,
+            max_tokens=128,
+        )
+        resp = await cc_client.chat(payload)
+        rv.assert_ok(resp)
+        rv.assert_schema(resp.json())
+
+
+@pytest.mark.asyncio
+@pytest.mark.reasoning
+async def test_ccr_multi_turn_with_thinking(
+    cc_client: ClaudeCodeClient,
+    rv: ResponseValidator,
+) -> None:
+    """CCR multi-turn with thinking field in prior assistant message.
+
+    When a previous turn used reasoning, CCR passes the thinking content
+    back in messages[n].thinking = {content, signature}.
+    This is a CCR-specific field with no OpenAI equivalent.
+    The gateway + LiteLLM must accept it without error.
+    """
+    payload = cc_client.multi_turn_with_thinking_payload(
+        model=_DEFAULT_MODEL,
+        user_message="Given your earlier answer, what is that number plus 10?",
+        prior_thinking_content="The user asked 5+3. That is 8.",
+        prior_thinking_signature="sig_test_12345",
+        prior_assistant_text="The answer is 8.",
+        effort="low",
+        max_tokens=128,
+    )
+    resp = await cc_client.chat(payload)
+    # Primary assertion: gateway must not reject the thinking field (no 4xx)
+    rv.assert_ok(resp)
+    rv.assert_schema(resp.json())
+
+
+@pytest.mark.asyncio
+async def test_ccr_cache_control_on_system_message(
+    cc_client: ClaudeCodeClient,
+    rv: ResponseValidator,
+) -> None:
+    """CCR passes cache_control on messages (Anthropic prompt caching).
+
+    The gateway must not return an error when cache_control is present.
+    Whether the upstream honours it depends on the provider.
+    """
+    long_system = (
+        "You are an expert assistant. " * 50  # simulate a long cached system prompt
+    )
+    payload = cc_client.cached_messages_payload(
+        model=_DEFAULT_MODEL,
+        long_system_prompt=long_system,
+        user_message="Summarise your role in one sentence.",
+        max_tokens=64,
+    )
+    resp = await cc_client.chat(payload)
+    rv.assert_ok(resp)
+    rv.assert_schema(resp.json())

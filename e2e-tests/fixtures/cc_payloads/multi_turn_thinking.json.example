@@ -1,0 +1,30 @@
+{
+  "_comment": "Rename to multi_turn_thinking.json — CCR multi-turn with prior thinking content.",
+  "_notes": [
+    "When a previous assistant turn used extended thinking, CCR passes",
+    "the thinking content back in the assistant message as:",
+    "  messages[n].thinking = { content: '...', signature: '...' }",
+    "This is a CCR-specific field that has NO OpenAI equivalent.",
+    "The signature is a timestamp-based identifier set by CCR.",
+    "The gateway + LiteLLM must accept this without 4xx errors."
+  ],
+  "model": "anthropic.claude-sonnet-4-5",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant. Think carefully."},
+    {"role": "user", "content": "What is 5 + 3?"},
+    {
+      "role": "assistant",
+      "content": "The answer is 8.",
+      "thinking": {
+        "content": "The user asked 5+3. Let me compute: 5+3=8.",
+        "signature": "1716500000000"
+      }
+    },
+    {"role": "user", "content": "What is that answer plus 10?"}
+  ],
+  "max_tokens": 256,
+  "reasoning": {
+    "effort": "low",
+    "enabled": true
+  }
+}

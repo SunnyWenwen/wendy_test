@@ -1,5 +1,14 @@
 {
-  "_comment": "Rename to reasoning.json — replace with real captured CCR reasoning request.",
+  "_comment": "Rename to reasoning.json — real captured CCR → LiteLLM reasoning request.",
+  "_notes": [
+    "CCR sends 'reasoning' dict (NOT OpenAI 'reasoning_effort' string).",
+    "reasoning.effort is derived from Anthropic thinking.budget_tokens via getThinkLevel():",
+    "  budget_tokens <= 1024  → effort: 'low'",
+    "  budget_tokens <= 8192  → effort: 'medium'",
+    "  budget_tokens >  8192  → effort: 'high'",
+    "reasoning.enabled=true is always set when thinking is active.",
+    "LiteLLM translates this to reasoning_effort before sending to upstream."
+  ],
   "model": "anthropic.claude-sonnet-4-5",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant. Think carefully."},
@@ -7,6 +16,7 @@
   ],
   "max_tokens": 1024,
   "reasoning": {
-    "effort": "medium"
+    "effort": "medium",
+    "enabled": true
   }
 }
