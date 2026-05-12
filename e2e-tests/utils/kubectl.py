@@ -87,15 +87,20 @@ class KubectlClient:
             k8s_config.load_incluster_config()
         self._core = k8s_client.CoreV1Api()
 
-    def _get_pod_name_by_prefix(self, prefix: str) -> str:
+    def _get_pod_name_by_prefix(self, prefix: str, exclude_prefixes: tuple[str, ...] = ()) -> str:
         """List all pods in the namespace and return the first Running one whose
-        name starts with *prefix*. Falls back to any phase if none are Running."""
+        name starts with *prefix*, skipping any pod whose name starts with an
+        entry in *exclude_prefixes*. Falls back to any phase if none are Running."""
         all_pods = self._core.list_namespaced_pod(namespace=settings.K8S_NAMESPACE)
-        matched = [p for p in all_pods.items if p.metadata.name.startswith(prefix)]
+        matched = [
+            p for p in all_pods.items
+            if p.metadata.name.startswith(prefix)
+            and not any(p.metadata.name.startswith(ex) for ex in exclude_prefixes)
+        ]
         if not matched:
             raise RuntimeError(
                 f"No pods found in namespace '{settings.K8S_NAMESPACE}' "
-                f"with name prefix '{prefix}'"
+                f"with name prefix '{prefix}' (excluding: {list(exclude_prefixes)})"
             )
         running = [p for p in matched if p.status.phase == "Running"]
         target = running[0] if running else matched[0]
@@ -124,7 +129,8 @@ class KubectlClient:
             if component == "litellm"
             else settings.AI_PROXY_POD_PREFIX
         )
-        pod_name = await asyncio.to_thread(self._get_pod_name_by_prefix, prefix)
+        exclude = settings.AI_PROXY_POD_EXCLUDE if component == "ai-proxy" else ()
+        pod_name = await asyncio.to_thread(self._get_pod_name_by_prefix, prefix, exclude)
         raw = await asyncio.to_thread(self._fetch_logs, pod_name, since_seconds)
         return PodLogs(component=component, pod_name=pod_name, raw=raw)
 

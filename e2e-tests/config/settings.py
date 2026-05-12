@@ -33,6 +33,11 @@ K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "icgs")
 # Set to a label selector string instead if your cluster uses stable labels.
 LITELLM_POD_PREFIX: str = os.getenv("LITELLM_POD_PREFIX", "litellm")
 AI_PROXY_POD_PREFIX: str = os.getenv("AI_PROXY_POD_PREFIX", "apisix")
+# Comma-separated pod name prefixes to exclude when searching for the ai-proxy pod.
+# e.g. apisix-redis-xxxxx and apisix-dashboard-xxxxx should not be mistaken for the gateway.
+AI_PROXY_POD_EXCLUDE: tuple[str, ...] = tuple(
+    p.strip() for p in os.getenv("AI_PROXY_POD_EXCLUDE", "apisix-redis,apisix-dashboard").split(",") if p.strip()
+)
 KUBECONFIG: str | None = os.getenv("KUBECONFIG")           # None → use in-cluster config
 LOG_TAIL_LINES: int = int(os.getenv("LOG_TAIL_LINES", "200"))
 LOG_CAPTURE_DELAY: float = float(os.getenv("LOG_CAPTURE_DELAY", "2.0"))  # seconds to wait before fetching logs
