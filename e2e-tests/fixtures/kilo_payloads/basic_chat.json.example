@@ -1,0 +1,19 @@
+{
+  "_comment": "Rename this file to basic_chat.json and replace with a real captured Kilo payload.",
+  "_instructions": [
+    "1. In Kilo, enable OpenAI Compatible provider pointing to the LLM Gateway.",
+    "2. Run a simple chat and capture the outgoing HTTP request (e.g. via mitmproxy or Kilo devtools).",
+    "3. Paste the JSON body here, removing sensitive data.",
+    "4. Rename file to basic_chat.json."
+  ],
+  "model": "anthropic.claude-sonnet-4-5",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, can you help me?"
+    }
+  ],
+  "max_tokens": 256,
+  "temperature": 1.0,
+  "stream": false
+}

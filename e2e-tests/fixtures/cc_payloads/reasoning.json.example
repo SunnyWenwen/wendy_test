@@ -1,0 +1,12 @@
+{
+  "_comment": "Rename to reasoning.json — replace with real captured CCR reasoning request.",
+  "model": "anthropic.claude-sonnet-4-5",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant. Think carefully."},
+    {"role": "user", "content": "Solve: if x + 3 = 7, what is x?"}
+  ],
+  "max_tokens": 1024,
+  "reasoning": {
+    "effort": "medium"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "_comment": "Rename to basic_chat.json — replace with real captured CCR request body.",
+  "_instructions": [
+    "1. Capture the HTTP request from CCR to LiteLLM (e.g. via kubectl logs or mitmproxy on the CCR pod).",
+    "2. The key difference from OpenAI: 'reasoning' field uses CCR unified format, not 'reasoning_effort'.",
+    "3. Other CCR-specific fields discovered should be added to agents/claude_code.py _CCR_EXTRA_FIELDS."
+  ],
+  "model": "anthropic.claude-sonnet-4-5",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello"}
+  ],
+  "max_tokens": 256,
+  "temperature": 1.0
+}

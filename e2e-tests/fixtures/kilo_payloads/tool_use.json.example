@@ -1,0 +1,29 @@
+{
+  "_comment": "Rename to tool_use.json — replace with real captured Kilo tool-use request.",
+  "model": "anthropic.claude-sonnet-4-5",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What's the weather in Tokyo?"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "max_tokens": 512
+}

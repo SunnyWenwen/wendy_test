@@ -1,0 +1,53 @@
+# Model registry for LLM Gateway E2E tests.
+# Each entry maps a test alias to the model ID sent to the gateway,
+# the upstream provider, and a capability flag set used to decide
+# which test suites apply.
+#
+# capabilities:
+#   streaming   – supports SSE streaming
+#   tool_use    – supports function / tool calling
+#   reasoning   – supports extended thinking (reasoning_effort / thinking)
+#   vision      – supports image input
+#   long_ctx    – context window >= 100k tokens
+
+bedrock:
+  claude-sonnet-4-5:
+    model_id: "anthropic.claude-sonnet-4-5"
+    upstream: bedrock
+    capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
+
+  claude-sonnet-4-6:
+    model_id: "anthropic.claude-sonnet-4-6"
+    upstream: bedrock
+    capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
+
+  claude-opus-4-5:
+    model_id: "anthropic.claude-opus-4-5"
+    upstream: bedrock
+    capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
+
+  claude-opus-4-6:
+    model_id: "anthropic.claude-opus-4-6"
+    upstream: bedrock
+    capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
+
+vertex:
+  gemini-2-5-pro:
+    model_id: "google/gemini-2.5-pro"
+    upstream: vertex
+    capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
+
+  gemini-2-5-flash:
+    model_id: "google/gemini-2.5-flash"
+    upstream: vertex
+    capabilities: [streaming, tool_use, vision, long_ctx]
+
+  gemini-3-pro:
+    model_id: "google/gemini-3-pro"
+    upstream: vertex
+    capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
+
+  gemini-3-flash:
+    model_id: "google/gemini-3-flash"
+    upstream: vertex
+    capabilities: [streaming, tool_use, vision, long_ctx]
