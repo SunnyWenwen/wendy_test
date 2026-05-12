@@ -115,7 +115,7 @@ bedrock:
 | `DEFAULT_REASONING_MODEL` | `claude-sonnet-4.6` | Reasoning 測試預設模型 |
 | `K8S_NAMESPACE` | `icgs` | Kubernetes namespace |
 | `LITELLM_POD_PREFIX` | `litellm` | LiteLLM pod name prefix（後綴隨機） |
-| `AI_PROXY_POD_PREFIX` | `ai-proxy-multi` | ai-proxy pod name prefix（後綴隨機） |
+| `AI_PROXY_POD_PREFIX` | `apisix` | Apisix gateway pod name prefix（後綴隨機） |
 | `ENABLE_LOG_VALIDATION` | `true` | 開啟 kubectl log assertions |
 | `LOG_TAIL_LINES` | `200` | 擷取的 log 行數 |
 | `LOG_CAPTURE_DELAY` | `2.0` | 請求後等待幾秒再取 log |
