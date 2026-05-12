@@ -3,6 +3,9 @@
 Fetches recent logs from the LiteLLM and ai-proxy-multi pods after each
 request so tests can assert on what actually hit the upstream.
 
+Pod discovery uses name-prefix matching (pods have random suffixes, e.g.
+litellm-7d9f4b-xxxxx) rather than label selectors.
+
 Usage::
 
     logs = await KubectlClient().capture_logs(component="litellm", since_seconds=10)
@@ -13,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -73,7 +75,7 @@ class PodLogs:
 
 
 class KubectlClient:
-    """Wraps the Kubernetes Python client to capture pod logs synchronously."""
+    """Wraps the Kubernetes Python client to capture pod logs by name prefix."""
 
     def __init__(self) -> None:
         try:
@@ -82,23 +84,21 @@ class KubectlClient:
             else:
                 k8s_config.load_kube_config()
         except Exception:
-            # Fall back to in-cluster config (when running inside a pod)
             k8s_config.load_incluster_config()
         self._core = k8s_client.CoreV1Api()
 
-    def _get_pod_name(self, label_selector: str) -> str:
-        pods = self._core.list_namespaced_pod(
-            namespace=settings.K8S_NAMESPACE,
-            label_selector=label_selector,
-        )
-        if not pods.items:
+    def _get_pod_name_by_prefix(self, prefix: str) -> str:
+        """List all pods in the namespace and return the first Running one whose
+        name starts with *prefix*. Falls back to any phase if none are Running."""
+        all_pods = self._core.list_namespaced_pod(namespace=settings.K8S_NAMESPACE)
+        matched = [p for p in all_pods.items if p.metadata.name.startswith(prefix)]
+        if not matched:
             raise RuntimeError(
                 f"No pods found in namespace '{settings.K8S_NAMESPACE}' "
-                f"matching label '{label_selector}'"
+                f"with name prefix '{prefix}'"
             )
-        # Prefer running pods
-        running = [p for p in pods.items if p.status.phase == "Running"]
-        target = running[0] if running else pods.items[0]
+        running = [p for p in matched if p.status.phase == "Running"]
+        target = running[0] if running else matched[0]
         return target.metadata.name
 
     def _fetch_logs(self, pod_name: str, since_seconds: int) -> str:
@@ -119,12 +119,12 @@ class KubectlClient:
         """Capture recent logs for the given component asynchronously."""
         await asyncio.sleep(delay if delay is not None else settings.LOG_CAPTURE_DELAY)
 
-        label = (
-            settings.LITELLM_POD_LABEL
+        prefix = (
+            settings.LITELLM_POD_PREFIX
             if component == "litellm"
-            else settings.AI_PROXY_POD_LABEL
+            else settings.AI_PROXY_POD_PREFIX
         )
-        pod_name = await asyncio.to_thread(self._get_pod_name, label)
+        pod_name = await asyncio.to_thread(self._get_pod_name_by_prefix, prefix)
         raw = await asyncio.to_thread(self._fetch_logs, pod_name, since_seconds)
         return PodLogs(component=component, pod_name=pod_name, raw=raw)
 

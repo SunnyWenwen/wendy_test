@@ -113,9 +113,9 @@ bedrock:
 | `DEFAULT_BEDROCK_MODEL` | `claude-sonnet-4.5` | 一般測試預設模型 |
 | `DEFAULT_VERTEX_MODEL` | `gemini-3.1-flash-lite-preview` | Vertex 測試預設模型 |
 | `DEFAULT_REASONING_MODEL` | `claude-sonnet-4.6` | Reasoning 測試預設模型 |
-| `K8S_NAMESPACE` | `llm-gateway` | Kubernetes namespace |
-| `LITELLM_POD_LABEL` | `app=litellm` | LiteLLM pod label selector |
-| `AI_PROXY_POD_LABEL` | `app=ai-proxy-multi` | ai-proxy pod label selector |
+| `K8S_NAMESPACE` | `icgs` | Kubernetes namespace |
+| `LITELLM_POD_PREFIX` | `litellm` | LiteLLM pod name prefix（後綴隨機） |
+| `AI_PROXY_POD_PREFIX` | `ai-proxy-multi` | ai-proxy pod name prefix（後綴隨機） |
 | `ENABLE_LOG_VALIDATION` | `true` | 開啟 kubectl log assertions |
 | `LOG_TAIL_LINES` | `200` | 擷取的 log 行數 |
 | `LOG_CAPTURE_DELAY` | `2.0` | 請求後等待幾秒再取 log |

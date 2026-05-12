@@ -28,9 +28,11 @@ DEFAULT_VERTEX_MODEL: str = os.getenv("DEFAULT_VERTEX_MODEL", "gemini-3.1-flash-
 DEFAULT_REASONING_MODEL: str = os.getenv("DEFAULT_REASONING_MODEL", "claude-sonnet-4.6")
 
 # ── Kubernetes (for log validation) ──────────────────────────────────────────
-K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "llm-gateway")
-LITELLM_POD_LABEL: str = os.getenv("LITELLM_POD_LABEL", "app=litellm")
-AI_PROXY_POD_LABEL: str = os.getenv("AI_PROXY_POD_LABEL", "app=ai-proxy-multi")
+K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "icgs")
+# Pod lookup is done by name prefix (pods have random suffixes, e.g. litellm-7d9f4b-xxxxx).
+# Set to a label selector string instead if your cluster uses stable labels.
+LITELLM_POD_PREFIX: str = os.getenv("LITELLM_POD_PREFIX", "litellm")
+AI_PROXY_POD_PREFIX: str = os.getenv("AI_PROXY_POD_PREFIX", "ai-proxy-multi")
 KUBECONFIG: str | None = os.getenv("KUBECONFIG")           # None → use in-cluster config
 LOG_TAIL_LINES: int = int(os.getenv("LOG_TAIL_LINES", "200"))
 LOG_CAPTURE_DELAY: float = float(os.getenv("LOG_CAPTURE_DELAY", "2.0"))  # seconds to wait before fetching logs
