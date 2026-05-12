@@ -446,6 +446,74 @@ gemini-3.1-pro-preview     ── basic ✓  streaming ✓  tool_use ✓  reason
 
 ---
 
+### 3.5.1 capabilities 設計由需求反推
+
+capabilities 清單（`streaming`、`tool_use`、`reasoning`、`vision`、`long_ctx`）不是隨意列舉，而是從「兩個 Agent 在真實工作中會做什麼」**往回推導**出來的。
+
+#### 反推起點：Agent 真實行為是什麼？
+
+**Claude Code（CCR）**
+
+| 實際行為 | 對應能力 |
+|---|---|
+| 幾乎永遠開啟 stream:true | `streaming` |
+| 呼叫 Bash、Read、Write、Edit 等工具 | `tool_use` |
+| 使用 Extended Thinking 分析複雜問題 | `reasoning` |
+| 讀取程式碼截圖 / 設計圖 | `vision`（保留） |
+| 一次讀入整個大型 Repo | `long_ctx`（保留） |
+
+**Kilo Code**
+
+| 實際行為 | 對應能力 |
+|---|---|
+| stream:true、temperature=0 | `streaming` |
+| Cline 工具集（execute_command 等） | `tool_use` |
+| reasoning_effort 參數 | `reasoning` |
+| 截圖 / 圖片附件 | `vision`（保留） |
+| 大型專案多輪對話 | `long_ctx`（保留） |
+
+#### 反推邏輯：哪些行為最容易在 Gateway 層出問題？
+
+```
+Agent 行為               最容易出問題的環節              需要測試能力
+
+stream:true    →   SSE chunked 傳輸 / 緩衝區設定    →   streaming
+tool_calls     →   JSON schema 轉換 / function call  →   tool_use
+reasoning{}    →   CCR dict → reasoning_effort 翻譯  →   reasoning  ← 最高風險
+image input    →   base64 multipart 轉換             →   vision
+100k+ tokens   →   context window 截斷 / timeout     →   long_ctx
+```
+
+> **為什麼 reasoning 是最高風險？**  
+> 因為 CCR 使用非標準的 `reasoning: {effort, enabled}` dict，而 LiteLLM 必須將它翻譯為 `reasoning_effort` 字串後才能送給 upstream。這個翻譯只在 CCR 路徑存在，一旦翻譯邏輯有 bug，LiteLLM 會靜默忽略 reasoning 或送出錯誤格式，且 HTTP 層看不出來——必須靠 kubectl log 驗證。
+
+#### 為什麼是這 5 個而不是更多或更少？
+
+| 能力 | 納入原因 | 目前狀態 |
+|---|---|---|
+| `streaming` | 兩個 Agent 幾乎 100% 使用，不測無法發現 chunked 傳輸問題 | ✅ 已實作 |
+| `tool_use` | 兩個 Agent 的核心工作流，無 tool_calls 等於 Agent 功能喪失 | ✅ 已實作 |
+| `reasoning` | CCR 格式轉換的最高風險點，必須雙層（HTTP + log）驗證 | ✅ 已實作 |
+| `vision` | Kilo 支援圖片，後續補 fixtures 後自動納入矩陣 | 🔖 保留 |
+| `long_ctx` | Claude Code 讀大型 Repo 的場景，需要特殊 payload | 🔖 保留 |
+
+#### capabilities 的作用：控制 pytest 自動 parametrize 範圍
+
+capabilities 本身**不是送給 API 的參數**，而是 **pytest 的路由標記**。
+
+```python
+# conftest.py 示意
+def pytest_generate_tests(metafunc):
+    if "reasoning_model" in metafunc.fixturenames:
+        # 只有 capabilities 包含 reasoning 的模型才會被納入 parametrize
+        params = models_with_capability("reasoning")
+        metafunc.parametrize("reasoning_model", params)
+```
+
+效果：`gemini-3.1-flash-lite-preview` 因不含 `reasoning` 能力，不會被 `test_reasoning_*` 系列測試 parametrize 到，避免因模型不支援導致誤報失敗。
+
+---
+
 ### 3.6 Reasoning / Extended Thinking 測試
 
 **目的**：驗證 reasoning 功能在兩條路徑（CCR / Kilo）上均可正常運作，並確認 LiteLLM 翻譯邏輯正確。
