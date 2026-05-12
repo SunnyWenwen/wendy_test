@@ -34,8 +34,8 @@ bedrock:
     capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
 
 vertex:
-  gemini-3-pro-preview:
-    model_id: "gemini-3-pro-preview"
+  gemini-2-5-pro:
+    model_id: "gemini-2.5-pro"
     upstream: vertex
     capabilities: [streaming, tool_use, reasoning, vision, long_ctx]
 
@@ -43,3 +43,8 @@ vertex:
     model_id: "gemini-3.1-flash-lite-preview"
     upstream: vertex
     capabilities: [streaming, tool_use, vision, long_ctx]
+
+  gemini-3-1-pro-preview:
+    model_id: "gemini-3.1-pro-preview"
+    upstream: vertex
+    capabilities: [streaming, tool_use, reasoning, vision, long_ctx]

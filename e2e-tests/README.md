@@ -65,8 +65,9 @@ e2e-tests/
 | `claude-sonnet-4.6` | AWS Bedrock | streaming, tool_use, reasoning, vision |
 | `claude-opus-4.6` | AWS Bedrock | streaming, tool_use, reasoning, vision |
 | `claude-opus-4.7` | AWS Bedrock | streaming, tool_use, reasoning, vision |
-| `gemini-3-pro-preview` | Vertex AI | streaming, tool_use, reasoning, vision |
+| `gemini-2.5-pro` | Vertex AI | streaming, tool_use, reasoning, vision |
 | `gemini-3.1-flash-lite-preview` | Vertex AI | streaming, tool_use, vision |
+| `gemini-3.1-pro-preview` | Vertex AI | streaming, tool_use, reasoning, vision |
 
 ---
 

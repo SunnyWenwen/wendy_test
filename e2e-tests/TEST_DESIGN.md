@@ -407,7 +407,7 @@ Kilo 直接使用 `reasoning_effort` 字串，不用 CCR 的 dict 格式。
 | 測試項目 | Client | 模型 | 驗證重點 |
 |---|---|---|---|
 | CC Streaming Bedrock | CCR | claude-sonnet-4.5 | chunks 數量 > 1，內容非空 |
-| CC Streaming Vertex | CCR | gemini-3.1-flash-lite-preview | chunks 數量 > 1 |
+| CC Streaming Vertex | CCR | gemini-3.1-flash-lite-preview | chunks 數量 > 1，內容非空 |
 | Kilo Streaming Bedrock | Kilo | claude-sonnet-4.5 | 最終 chunk 包含 usage 統計 |
 | Streaming Chunk Schema | Kilo | claude-sonnet-4.5 | 每個 chunk 符合 OpenAI SSE schema |
 | Finish Reason | Kilo | claude-sonnet-4.5 | 最後一個 chunk 的 finish_reason = "stop" |
@@ -434,13 +434,14 @@ Kilo 直接使用 `reasoning_effort` 字串，不用 CCR 的 dict 格式。
 **當前模型矩陣：**
 
 ```
-claude-sonnet-4.5   ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
-claude-sonnet-4.6   ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
-claude-opus-4.6     ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
-claude-opus-4.7     ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
-gemini-3-pro-preview── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
+claude-sonnet-4.5          ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
+claude-sonnet-4.6          ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
+claude-opus-4.6            ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
+claude-opus-4.7            ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
+gemini-2.5-pro             ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
 gemini-3.1-flash-lite-preview
-                    ── basic ✓  streaming ✓  tool_use ✓
+                           ── basic ✓  streaming ✓  tool_use ✓
+gemini-3.1-pro-preview     ── basic ✓  streaming ✓  tool_use ✓  reasoning ✓
 ```
 
 ---
@@ -505,14 +506,14 @@ reasoning: {        →   reasoning_effort:   →   適當的 provider
 | 連線驗證 | 5 | `connectivity` |
 | Claude Code / CCR | 9 | `claude_code` |
 | Kilo Code | 7 | `kilo` |
-| 全模型矩陣（基本） | 6 個模型 | `bedrock` / `vertex` |
-| 全模型矩陣（streaming） | 6 個模型 | `streaming` |
-| 全模型矩陣（tool_use） | 6 個模型 | `tool_use` |
+| 全模型矩陣（基本） | 7 個模型 | `bedrock` / `vertex` |
+| 全模型矩陣（streaming） | 7 個模型 | `streaming` |
+| 全模型矩陣（tool_use） | 7 個模型 | `tool_use` |
 | Streaming 詳細驗證 | 5 | `streaming` |
 | 工具調用 Round-Trip | 4 | `tool_use` |
 | Reasoning（單模型） | 6 | `reasoning` |
-| Reasoning（全模型） | 5 個模型 | `reasoning`, `slow` |
-| **合計（含矩陣展開）** | **約 60+ 個 test case** | |
+| Reasoning（全模型） | 6 個模型 | `reasoning`, `slow` |
+| **合計（含矩陣展開）** | **約 70+ 個 test case** | |
 
 ---
 

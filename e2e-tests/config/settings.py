@@ -24,7 +24,7 @@ CHAT_COMPLETIONS_PATH: str = "/chat/completions"
 # These should match model_id values in config/models.yaml.
 # Override via environment variables when running against a different deployment.
 DEFAULT_BEDROCK_MODEL: str = os.getenv("DEFAULT_BEDROCK_MODEL", "claude-sonnet-4.5")
-DEFAULT_VERTEX_MODEL: str = os.getenv("DEFAULT_VERTEX_MODEL", "gemini-3.1-flash-lite-preview")
+DEFAULT_VERTEX_MODEL: str = os.getenv("DEFAULT_VERTEX_MODEL", "gemini-3.1-flash-lite-preview")   # lightest Vertex model
 DEFAULT_REASONING_MODEL: str = os.getenv("DEFAULT_REASONING_MODEL", "claude-sonnet-4.6")
 
 # ── Kubernetes (for log validation) ──────────────────────────────────────────
