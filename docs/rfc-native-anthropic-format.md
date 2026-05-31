@@ -1,4 +1,4 @@
-# RFC：Native Anthropic Format 支援架構設計
+# RFC: Native Anthropic Format Support Architecture Design
 
 > **狀態：** 提案中  
 > **日期：** 2026-05-31  
@@ -22,10 +22,10 @@
 目前平台提供 OpenAI 相容格式的 LLM API，架構為：
 
 ```
-User (OpenAI format) → APISIX → Python/LiteLLM SDK → AWS Bedrock Claude
+User (OpenAI format) → APISIX → llm-proxy (LiteLLM SDK) → AWS Bedrock Claude
 ```
 
-APISIX 已強綁定 `ai-rate-limiting`（含 Redis TPM 計費）、`ai-proxy-multi`（failover/roundrobin/chash）及 `file-logger`。
+APISIX 已強綁定 `ai-rate-limiting`（含 Redis TPM limit）、`ai-proxy-multi`（failover/roundrobin/chash）及 `file-logger`。
 
 現在需要支援 **Native Anthropic Messages API 格式**（`/v1/messages`）。本 RFC 評估兩種實作方案，並提出建議架構。
 
@@ -33,7 +33,7 @@ APISIX 已強綁定 `ai-rate-limiting`（含 Redis TPM 計費）、`ai-proxy-mul
 
 ## 問題陳述
 
-### 核心限制：APISIX 3.15/3.16 的 Token 計費缺陷
+### 核心限制：APISIX 3.15/3.16 的 TPM limit 缺陷
 
 APISIX 3.15/3.16 的 `ai-proxy-multi` 僅能解析 **OpenAI format** 的 response 來填入 `ctx.ai_token_usage`。當 response 為 Anthropic format（含 `input_tokens` / `output_tokens`）時，token 提取失敗：
 
@@ -49,14 +49,14 @@ local function get_token_usage(conf, ctx)
 end
 ```
 
-TPM 計費分兩個階段：
+TPM limit 分兩個階段：
 
 | 階段 | 動作 | 問題 |
 |------|------|------|
 | access phase | Redis 讀取檢查（read-only） | ✅ 正常（cost=0）|
 | **log phase** | **實際扣 token 數（write）** | ❌ `ctx.ai_token_usage = nil`，永遠不扣 |
 
-**結論：只要 APISIX 收到的 response 是 Anthropic format，TPM 計費失效，rate limiting 無法正確運作。**
+**結論：只要 APISIX 收到的 response 是 Anthropic format，TPM limit 失效，rate limiting 無法正確運作。**
 
 ### APISIX 3.17 的狀態
 
@@ -65,16 +65,16 @@ PR #13181（`feat(ai-proxy): add native Anthropic Messages API protocol support`
 ### 需求整理
 
 - 支援 Native Anthropic `/v1/messages` 格式（含 streaming SSE）
-- **TPM 計費不能有誤差**
+- **TPM limit 不能有誤差**
 - 支援 failover（roundrobin / chash）
-- 自定義 header（如 `t-tenant-id`）必須從 user request 往後帶給 APISIX
+- 自定義 header（`t-request-id`、`Authorization: Bearer xxx`）必須從 user request 往後帶給 APISIX
 - 維持現有 OpenAI format 流量完全不受影響
 
 ---
 
 ## 建議方案
 
-**在 APISIX 前面部署一個 LiteLLM Python 轉換層（CCR 角色），用現有的 LiteLLM SDK 實作。**
+**在 APISIX 前面部署一個 LiteLLM Python 轉換層（CCR 角色），使用現有 llm-proxy repo 的 LiteLLM SDK 實作。**
 
 ### 架構要求
 
@@ -97,31 +97,33 @@ APISIX 看到的 response → OpenAI format  ← 才能填 ctx.ai_token_usage
 └──────────────────────────────────────────────────┬─┘───────┼───┘
                                                    │         │
                                                    ▼         │
-                              ┌─────────────────────────┐   │
-                              │  LiteLLM-CCR (新 instance)│   │
-                              │  port: 4001              │   │
+                              ┌──────────────────────────┐   │
+                              │  LiteLLM-CCR             │   │
+                              │  （基於 llm-proxy repo）  │   │
+                              │  port: 8000              │   │
                               │  - 接收 Anthropic format  │   │
                               │  - 轉換為 OpenAI format   │   │
                               │  - 轉發 custom headers    │   │
                               │  - 回轉 Anthropic format  │   │
-                              └────────────┬────────────┘   │
-                                           │ /v1/chat/completions│
-                                           │ + custom headers    │
+                              └────────────┬─────────────┘   │
+                                           │ /v1/chat/completions
+                                           │ + t-request-id
+                                           │ + Authorization: Bearer xxx
                                            ▼                 │
-                              ┌─────────────────────────┐   │
-                              │         APISIX           │◄──┘
-                              │  ai-rate-limiting (TPM)  │
-                              │  ai-proxy-multi (failover)│
-                              │  file-logger             │
-                              │  全程看 OpenAI format ✅  │
-                              └────────────┬────────────┘
+                              ┌──────────────────────────┐   │
+                              │         APISIX            │◄──┘
+                              │  ai-rate-limiting (TPM)   │
+                              │  ai-proxy-multi (failover) │
+                              │  file-logger              │
+                              │  全程看 OpenAI format ✅   │
+                              └────────────┬─────────────┘
                                            │
                                            ▼
-                              ┌─────────────────────────┐
-                              │  Python/LiteLLM SDK      │
-                              │  (現有，不動)             │
-                              │  port: 4000              │
-                              └────────────┬────────────┘
+                              ┌──────────────────────────┐
+                              │  llm-proxy (現有，不動)   │
+                              │  LiteLLM SDK             │
+                              │  port: 8000              │
+                              └────────────┬─────────────┘
                                            │
                                            ▼
                                     AWS Bedrock Claude
@@ -132,26 +134,30 @@ APISIX 看到的 response → OpenAI format  ← 才能填 ctx.ai_token_usage
 ```
 User
  │  POST /v1/messages
- │  Headers: t-tenant-id: t-12345
+ │  Headers:
+ │    t-request-id: req-abc123
+ │    Authorization: Bearer <user-token>
  │  Body: { "model": "claude-3-5-sonnet", "messages": [...] }  ← Anthropic format
  ▼
 Virtual Service
- │  path routing: /v1/messages → LiteLLM-CCR:4001
+ │  path routing: /v1/messages → LiteLLM-CCR:8000
  ▼
-LiteLLM-CCR
+LiteLLM-CCR（llm-proxy repo，新 instance）
  │  1. 接收 Anthropic format request
- │  2. 提取 custom headers（t-tenant-id 等）
+ │  2. 提取 custom headers（t-request-id、Authorization）
  │  3. 透過 AnthropicAdapter 轉換為 OpenAI format
  │  4. 呼叫 APISIX:9080/v1/chat/completions
- │     Headers: t-tenant-id: t-12345（帶入）
+ │     Headers:
+ │       t-request-id: req-abc123（帶入）
+ │       Authorization: Bearer <user-token>（帶入）
  ▼
 APISIX
  │  access phase:
- │    ai-rate-limiting: 讀 Redis，檢查 TPM（✅ OpenAI format，正常）
+ │    ai-rate-limiting: 讀 Redis，檢查 TPM limit（✅ OpenAI format，正常）
  │    ai-proxy-multi: 選 instance（failover/roundrobin）
- │  forward to Python/LiteLLM SDK
+ │  forward to llm-proxy
  ▼
-Python/LiteLLM SDK → AWS Bedrock
+llm-proxy (LiteLLM SDK) → AWS Bedrock
  │  回傳 OpenAI format response
  ▼
 APISIX
@@ -174,7 +180,7 @@ User
 
 ### LiteLLM-CCR 實作
 
-使用現有 Python/LiteLLM SDK，部署第二個 instance，`api_base` 指向 APISIX 而非 Bedrock。
+基於現有 **llm-proxy repo** 的 LiteLLM SDK，部署第二個 instance，`api_base` 指向 APISIX 而非 Bedrock。兩個 instance 使用相同 port 8000，部署在不同 container。
 
 #### config.yaml（LiteLLM proxy 模式）
 
@@ -195,41 +201,42 @@ model_list:
 litellm_settings:
   drop_params: true  # top_k 等 OpenAI 不支援的參數自動忽略
   forward_pass_through_headers:
-    - t-tenant-id        # 租戶 ID，ai-rate-limiting 讀取
-    - x-consumer-id      # 其他自定義 header
-    - x-request-id
+    - t-request-id      # request 追蹤 ID
+    - authorization     # Bearer token，帶給 APISIX 做驗證
 ```
 
-#### 或 SDK 模式（Python FastAPI）
+#### 或 SDK 模式（Python FastAPI，基於 llm-proxy repo）
 
 ```python
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import litellm
-import httpx
+import os
 
 app = FastAPI()
 
 APISIX_BASE_URL = "http://apisix-internal:9080"
 APISIX_KEY = os.environ["APISIX_CONSUMER_KEY"]
 
-# 需要往後帶的 custom headers
-FORWARD_HEADERS = ["t-tenant-id", "x-consumer-id", "x-request-id"]
+# 需要往後帶給 APISIX 的 custom headers
+FORWARD_HEADERS = ["t-request-id", "authorization"]
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     body = await request.json()
     is_streaming = body.get("stream", False)
 
-    # 提取需要轉發的 custom headers
+    # 提取並轉發 custom headers
     extra_headers = {
         h: request.headers[h]
         for h in FORWARD_HEADERS
         if h in request.headers
     }
-    extra_headers["Authorization"] = f"Bearer {APISIX_KEY}"
+    # 若 Authorization 未帶入則補上 APISIX consumer key
+    if "authorization" not in extra_headers:
+        extra_headers["authorization"] = f"Bearer {APISIX_KEY}"
 
-    # LiteLLM AnthropicAdapter 處理轉換，打 APISIX（OpenAI format）
+    # LiteLLM AnthropicAdapter 轉換，打 APISIX（OpenAI format）
     response = await litellm.acompletion(
         model="openai/" + body["model"],
         messages=body["messages"],
@@ -241,13 +248,11 @@ async def anthropic_messages(request: Request):
     )
 
     if is_streaming:
-        # streaming: OpenAI SSE → Anthropic SSE 格式轉換
         return StreamingResponse(
             convert_openai_stream_to_anthropic(response),
             media_type="text/event-stream"
         )
 
-    # non-streaming: 轉回 Anthropic format
     return convert_openai_response_to_anthropic(response)
 ```
 
@@ -264,7 +269,7 @@ spec:
     - destination:
         host: litellm-ccr
         port:
-          number: 4001
+          number: 8000
   - match:
     - uri:
         prefix: /v1/chat/completions    # 現有，不動
@@ -307,7 +312,7 @@ spec:
 | 缺點 | 說明 | 緩解措施 |
 |------|------|----------|
 | 多一個網路 hop | 每個 Anthropic format 請求多經過一層 | LiteLLM-CCR 部署在同一 cluster，延遲影響 < 5ms |
-| 需維護第二個 instance | 多一個服務要監控、部署 | 使用與現有相同的 Docker image，僅 config 不同 |
+| 需維護第二個 instance | 多一個服務要監控、部署 | 使用與 llm-proxy 相同的 Docker image，僅 config 不同 |
 | 兩次格式轉換 | Anthropic→OpenAI（CCR）+ OpenAI→Bedrock（現有）| 轉換皆為 in-memory，CPU 成本極低 |
 | streaming 轉換複雜 | OpenAI SSE ↔ Anthropic SSE 格式差異大 | LiteLLM 1.83.14 已內建處理，非自行實作 |
 | 臨時方案 | 等 APISIX 3.17 後需退場 | 退場流程簡單，Virtual Service 改一條 rule |
@@ -317,6 +322,8 @@ spec:
 ## 替代方案比較
 
 ### 方案 A：Claude Code Router（musistudio/claude-code-router）
+
+#### 功能評估
 
 | 評估面向 | 結論 |
 |---------|------|
@@ -331,7 +338,40 @@ spec:
 | 維護風險 | 高（個人 OSS 專案，無企業支撐，patch 需持續 rebase） |
 | **結論** | ❌ **不建議** |
 
-**不採用原因：** Custom header forwarding（`t-tenant-id` 等）是 ai-rate-limiting 租戶計費的關鍵，CCR 需要 fork 才能支援，引入高維護風險。且 CCR 為個人工具，多租戶並發場景未經驗證。
+#### CCR 能否獨立打包成一個模組？
+
+技術上可行，但代價不低，以下逐點說明：
+
+**1. 需要 fork 並大幅裁剪原始碼**
+
+CCR 的格式轉換邏輯（`AnthropicTransformer`、`ToolUseTransformer`、`ReasoningTransformer` 等）分散在多個 TypeScript 檔案，且與 Claude Code CLI 的 routing 邏輯緊耦合（background / thinking / longContext router rules、Web UI `/ui/`、PM2 process manager、preset marketplace 等）。要獨立打包需要手動提取 transformer 模組，去掉所有 CLI 專用邏輯，工程量不小。
+
+**2. 仍需新增 custom header forwarding**
+
+CCR 的 Fastify server 沒有從 incoming request 動態轉發 header 給 backend 的功能。即使打包後，仍需手動在 request handler 中加入：
+
+```typescript
+// 需要手動 patch
+const incomingHeaders = request.headers;
+outgoingHeaders['t-request-id'] = incomingHeaders['t-request-id'];
+outgoingHeaders['authorization'] = incomingHeaders['authorization'];
+```
+
+**3. 技術棧異質**
+
+CCR 是 Node.js / TypeScript，與現有 Python stack 不同，意味著需要額外維護 Node.js 的部署流程、監控體系、Dockerfile，以及團隊需要具備 TypeScript 維護能力。
+
+**4. 上游同步問題**
+
+當 CCR upstream 修復 streaming bug、新增新的 Anthropic 模型格式支援時（例如 claude-opus-4 的新參數），你的 fork 需要手動 merge。隨著時間拉長，fork 與 upstream 的差距越來越大，維護成本持續累積。相比之下，LiteLLM 透過 `pip upgrade` 即可取得所有修復。
+
+**5. 多租戶並發未驗證**
+
+CCR 設計為單一 Claude Code CLI 用戶使用，沒有多租戶高並發的壓力測試數據或對應的設計（如 connection pool、rate limit、graceful shutdown 等）。
+
+**結論：即使將 CCR 打包成獨立模組，仍比 LiteLLM 方案需要更多工程投入與長期維護成本，且無法解決技術棧異質的問題。**
+
+---
 
 ### 方案 B：LiteLLM SDK / Proxy（**建議採用**）
 
@@ -342,12 +382,14 @@ spec:
 | Streaming SSE 轉換 | ✅ 內建 AnthropicStreamWrapper |
 | thinking / tool_use / top_k | ✅ `drop_params: true` 自動處理 |
 | **Custom header forwarding** | ✅ `forward_pass_through_headers` config 或 `extra_headers` SDK 參數 |
-| AWS Bedrock 原生支援 | ✅（現有 instance 已使用）|
+| AWS Bedrock 原生支援 | ✅（現有 llm-proxy 已使用）|
 | 多租戶並發穩定性 | ✅ 設計目標之一 |
-| 技術棧 | ✅ Python（與現有相同）|
+| 技術棧 | ✅ Python（與現有 llm-proxy 相同）|
 | 維護風險 | 低（BerriAI 商業版支撐，v1.83.14 已穩定）|
-| 已在 stack 中 | ✅ 現有服務，無新依賴 |
+| 已在 stack 中 | ✅ llm-proxy repo 現有服務，無新依賴 |
 | **結論** | ✅ **建議採用** |
+
+---
 
 ### 方案 C：等待 APISIX 3.17.0
 
@@ -358,16 +400,18 @@ spec:
 | 風險 | ✅ 最低（官方支援）|
 | **結論** | 可作為長期方案，但無法滿足當前需求 |
 
+---
+
 ### 方案比較總表
 
-| | CCR | **LiteLLM SDK** | APISIX 3.17 |
-|--|-----|-----------------|-------------|
-| TPM 準確 | ✅ | ✅ | ✅ |
-| Custom headers | ❌ 需 fork | ✅ | ✅ |
+| | CCR（含打包）| **LiteLLM SDK** | APISIX 3.17 |
+|--|-------------|-----------------|-------------|
+| TPM limit 準確 | ✅ | ✅ | ✅ |
+| Custom headers | ❌ 需 fork + patch | ✅ | ✅ |
 | Streaming | ✅ | ✅ | ✅ |
 | 現有技術棧 | ❌ Node.js | ✅ Python | ✅ |
 | 生產驗證 | ❌ | ✅ | ✅ |
-| 可立即部署 | ❌（需 fork）| ✅ | ❌（待發布）|
+| 可立即部署 | ❌（需 fork + 裁剪）| ✅ | ❌（待發布）|
 | 維護負擔 | 高 | 低 | 無 |
 | **建議** | ❌ | **✅ 採用** | 升版後替換 |
 
@@ -375,8 +419,8 @@ spec:
 
 ## 決策
 
-**採用方案 B：LiteLLM SDK 作為 Anthropic Format Converter（CCR 角色）。**
+**採用方案 B：LiteLLM SDK（llm-proxy repo）作為 Anthropic Format Converter（CCR 角色）。**
 
-部署一個新的 LiteLLM instance（`litellm-ccr`），`api_base` 指向 APISIX，負責 Anthropic ↔ OpenAI 雙向格式轉換。Virtual Service 新增 `/v1/messages` path rule 指向此 instance，現有 OpenAI 流量完全不受影響。
+基於現有 llm-proxy repo 部署一個新的 LiteLLM instance（`litellm-ccr`，port 8000），`api_base` 指向 APISIX，負責 Anthropic ↔ OpenAI 雙向格式轉換，並轉發 `t-request-id`、`Authorization` 等 custom headers。Virtual Service 新增 `/v1/messages` path rule 指向此 instance，現有 OpenAI 流量完全不受影響。
 
 當 APISIX 3.17.0 發布後，執行退場計畫，將轉換責任移交 APISIX 原生支援。
